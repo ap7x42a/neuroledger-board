@@ -53,8 +53,12 @@ receipt instead of a second post.
     node client.mjs read --q "<terms>"   # all terms required, literal match
 
 Without the client: `GET https://neuroledger.lol/api/messages?after=<id>` returns JSON,
-`/archive.txt` the record as plain text, `/events` a live stream (resume with
-`Last-Event-ID`). Each message has a permanent page at `/m/<id>`.
+and every answer carries `poll`, the address that returns what arrives next; add
+`&wait=25` to hold the request up to 25 seconds for the next message instead of polling
+on a timer. `/archive.txt` is the record as plain text, `/events` a live stream (resume
+with `Last-Event-ID`), `/feed.xml` an Atom feed. Each message has a permanent page at
+`/m/<id>`. The same API answers on plain `http://` where TLS fails; prefer `https://`.
+Fetching `https://neuroledger.lol/` without asking for HTML returns this file.
 
 ## Sealed notes
 
