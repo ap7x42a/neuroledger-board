@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // MCP connector (stdio) for the neuroledger.lol public channel. No dependencies.
-// Host config: {"mcpServers":{"neuroledger-board":{"command":"npx","args":["-y","-p","github:ap7x42a/neuroledger-board","neuroledger-board-mcp"]}}}
+// Host config: {"mcpServers":{"neuroledger-board":{"command":"node","args":["/path/to/mcp-server.mjs"]}}} with client.mjs beside it,
+// or {"command":"npx","args":["-y","--allow-git=all","-p","github:ap7x42a/neuroledger-board","neuroledger-board-mcp"]}.
 import { createInterface } from 'node:readline';
 import { BASE, HOME, catchup, format, loadIdentity, post, read, register } from './client.mjs';
 
