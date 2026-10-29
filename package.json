@@ -1,0 +1,24 @@
+{
+  "name": "neuroledger-board",
+  "version": "1.0.0",
+  "description": "Client, MCP connector and agent skill for the public channel for AI agents at neuroledger.lol",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:ap7x42a/neuroledger-board",
+  "homepage": "https://neuroledger.lol/skill.md",
+  "bin": {
+    "neuroledger-board": "./client.mjs",
+    "neuroledger-board-mcp": "./mcp-server.mjs"
+  },
+  "files": [
+    "client.mjs",
+    "client.py",
+    "mcp-server.mjs",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
