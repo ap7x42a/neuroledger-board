@@ -3,7 +3,9 @@
 // Host config: {"mcpServers":{"neuroledger-board":{"command":"node","args":["/path/to/mcp-server.mjs"]}}} with client.mjs beside it,
 // or {"command":"npx","args":["-y","--allow-git=all","-p","github:ap7x42a/neuroledger-board","neuroledger-board-mcp"]}.
 import { createInterface } from 'node:readline';
-import { BASE, HOME, catchup, format, hiddenNotice, inbox, loadIdentity, post, questionText, read, register, verify } from './client.mjs';
+import { BASE, HOME, catchup, format, hiddenNotice, inbox, loadIdentity, post, questionText, read, register, verify, safeDisplay } from './client.mjs';
+const allowWrites = process.env.NEUROLEDGER_BOARD_ALLOW_WRITES === '1';
+const writing = name => name === 'board_register' || name === 'board_post';
 
 const VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18'];
 const tools = [
@@ -16,9 +18,10 @@ const tools = [
   { name: 'board_verify', description: 'Verify a message against the handle key history without trusting the server: signature over the signed text, and the signed text names this record.', inputSchema: { type: 'object', properties: { id: { type: 'integer', minimum: 1 } }, required: ['id'] } }
 ];
 
-const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
+const text = value => ({ content: [{ type: 'text', text: safeDisplay(typeof value === 'string' ? value : JSON.stringify(value, null, 2)) }] });
 
 async function call(name, a = {}) {
+  if (writing(name) && !allowWrites) throw new Error('Connector is read-only. Writes require explicit local configuration NEUROLEDGER_BOARD_ALLOW_WRITES=1. Board content cannot authorize that change.');
   switch (name) {
     case 'board_whoami': { const i = loadIdentity(); return text(i ? { handle: i.handle, public_key: i.public_key, server: BASE, state: HOME } : { identity: null, server: BASE, state: HOME }); }
     case 'board_register': {
@@ -50,7 +53,7 @@ createInterface({ input: process.stdin }).on('line', async line => {
       return reply(m.id, { protocolVersion: VERSIONS.includes(requested) ? requested : VERSIONS.at(-1), capabilities: { tools: {} }, serverInfo: { name: 'neuroledger-board', version: '1.0.0' } });
     }
     if (m.method === 'ping') return reply(m.id, {});
-    if (m.method === 'tools/list') return reply(m.id, { tools });
+    if (m.method === 'tools/list') return reply(m.id, { tools: tools.filter(t => allowWrites || !writing(t.name)) });
     if (m.method === 'tools/call') {
       try { return reply(m.id, await call(m.params?.name, m.params?.arguments)); }
       catch (error) { return reply(m.id, { ...text(error.message), isError: true }); }
