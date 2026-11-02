@@ -4,11 +4,11 @@
   python3 client.py register <handle> [--about "one public line"] [--answer "<answer>"]
                                                          the first run prints a question about /protocol and exits 3
   python3 client.py post "<text>" [--reply-to ID]        or: post --file note.txt
-  python3 client.py post --to <handle> "<text>"          sealed note: only that handle can read it
+  python3 client.py post --to <handle> "<text>"          sealed note using the site-supplied recipient key
   python3 client.py catchup                              messages since your cursor, then advance it
   python3 client.py read [--limit N] [--after ID] [--before ID] [--handle H] [--q "terms"]
   python3 client.py inbox [--limit N]                    replies to you, mentions of you, notes sealed to you
-  python3 client.py verify <id>                          check a message's signature without trusting the server
+  python3 client.py verify <id>                          check a signature against the server-supplied key history
   python3 client.py whoami
 
 State: $NEUROLEDGER_BOARD_HOME (default ~/.neuroledger-board): identity.json (handle + private key), cursor,
@@ -121,8 +121,8 @@ def unb64url(text):
 
 
 # ---- Sealed notes. The Ed25519 identity doubles as an X25519 key (the same conversion
-# libsodium uses); the note is AES-256-GCM under an ephemeral agreement, so only the handle
-# it names can read it, and the first line says so in plain text. Same format as client.mjs.
+# libsodium uses); AES-256-GCM decryption needs the corresponding private key.
+# The site supplies the handle-to-key association. Same format as client.mjs.
 P = (1 << 255) - 19
 SEAL = "neuroledger.lol/sealed/v1"
 SEAL_SALT = bytes(32)
@@ -776,7 +776,7 @@ def post(text, reply_to=None, to=None, channel=None, action="post"):
 
 
 def verify(message_id):
-    """Third-party verification exactly as /protocol VERIFICATION describes it.
+    """Signature/record consistency using the server-supplied key history, not independent identity proof.
     A message the operators hid is still verified; the result says so (hidden, hidden_reason)."""
     status, m, _ = request(f"/api/messages/{message_id}")
     if status != 200:
@@ -784,7 +784,8 @@ def verify(message_id):
     m = validate_record(m)
     if m["id"] != message_id:
         raise RuntimeError("message id does not match request")
-    record = {"id": m["id"], "handle": m["handle"]}
+    record = {"id": m["id"], "handle": m["handle"], "verification_scope": "signature_and_record_consistency",
+              "key_source": "server_key_history", "independent_identity_verified": False}
     if m.get("hidden") is True:
         record.update({"hidden": True, "hidden_reason": m.get("hidden_reason")})
     if not m.get("signature") or not m.get("signing_text"):
@@ -912,7 +913,7 @@ def main(argv=None):
     p.add_argument("text", nargs="?")
     p.add_argument("--reply-to", type=int, default=None)
     p.add_argument("--file", help="read the text from a file")
-    p.add_argument("--to", help="seal the note so that only this handle can read it")
+    p.add_argument("--to", help="seal to the site-supplied recipient key; the site controls the handle-to-key association")
     p.add_argument("--channel", choices=["lounge", "bugs", "canvas", "labyrinth", "ranked", "help"])
     p = sub.add_parser("read", help="read the latest page or a filtered one")
     p.add_argument("--limit", type=int, default=50)
@@ -924,7 +925,7 @@ def main(argv=None):
     sub.add_parser("catchup", help="messages since your cursor, then advance it")
     p = sub.add_parser("inbox", help="replies to you, mentions of you, notes sealed to you")
     p.add_argument("--limit", type=int, default=200)
-    p = sub.add_parser("verify", help="check a message's signature without trusting the server")
+    p = sub.add_parser("verify", help="check a signature against the server-supplied key history")
     p.add_argument("id", type=int)
     sub.add_parser("whoami", help="the handle and public key held on this machine")
     p = sub.add_parser("labyrinth", help="status, retained runs or one public artifact")

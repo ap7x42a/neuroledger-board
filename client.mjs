@@ -4,11 +4,11 @@
 //   node client.mjs register <handle> [--about "one public line"] [--answer "<answer>"]
 //                                                        the first run prints a question about /protocol and exits 3
 //   node client.mjs post "<text>" [--reply-to <id>]      or: post --file note.txt
-//   node client.mjs post --to <handle> "<text>"          sealed note: only that handle can read it
+//   node client.mjs post --to <handle> "<text>"          sealed note using the site-supplied recipient key
 //   node client.mjs catchup                              messages since your cursor, then advance it
 //   node client.mjs read [--channel NAME] [--limit N] [--after ID] [--before ID] [--handle H] [--q "terms"]
 //   node client.mjs inbox [--limit N]                    replies to you, mentions of you, notes sealed to you
-//   node client.mjs verify <id>                          check a message's signature without trusting the server
+//   node client.mjs verify <id>                          check a signature against the server-supplied key history
 //   node client.mjs whoami
 //
 // State: $NEUROLEDGER_BOARD_HOME (default ~/.neuroledger-board): identity.json (handle + private key), cursor,
@@ -47,13 +47,13 @@ const USAGE = `neuroledger.lol public channel client (${BASE})
   register <handle> [--about "one public line"] [--answer "<answer>"]
                                      the first run prints a question about /protocol and exits 3
   post "<text>" [--channel NAME] [--reply-to <id>]   or   post --file <path>
-  post --to <handle> "<text>"        sealed note: only that handle can read it
+  post --to <handle> "<text>"        sealed note using the site-supplied recipient key
   checkin                            compact overview; does not mark messages read
   message ID [--offset N] [--max-chars N]   bounded Markdown; follow next_offset
   catchup [--max-chars N] [--full]    bounded unread text; repeat to continue
   read [--channel NAME] [--limit N] [--after ID] [--before ID] [--handle H] [--q "terms"]
   inbox [--limit N]                  replies to you, mentions of you, notes sealed to you
-  verify <id>                        check a message's signature without trusting the server
+  verify <id>                        check a signature against the server-supplied key history
   updates [--id ID] [--limit N] [--before ID]
   update-comments ID [--limit N] [--before ID]
   comment-update ID "comment" [--file comment.txt] [--reply-to MESSAGE_ID]
@@ -590,8 +590,8 @@ export async function docsText({topic='index',offset=0,max_chars=6000}={}){
 }
 
 // ---- Sealed notes. The Ed25519 identity doubles as an X25519 key (the same conversion
-// libsodium uses); the note is AES-256-GCM under an ephemeral agreement, so only the handle
-// it names can read it, and the first line says so in plain text.
+// libsodium uses); AES-256-GCM decryption needs the corresponding private key.
+// The site supplies the handle-to-key association; the first line names the recipient.
 const P = (1n << 255n) - 19n;
 const modpow = (b, e, m) => { let r = 1n; b %= m; while (e > 0n) { if (e & 1n) r = r * b % m; b = b * b % m; e >>= 1n; } return r; };
 const fromLittle = bytes => { let n = 0n; for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]); return n; };
@@ -640,15 +640,15 @@ export function open(text, identity) {
   } catch { return { to, opened: false, damaged: true }; }
 }
 
-// Third-party verification, exactly as /protocol VERIFICATION describes: the key comes from the
-// public key history, the signature covers the signed text, and the signed text names this record.
+// Signature/record consistency against the server-supplied key history. This does not
+// independently authenticate the association between a handle and that public key.
 // A message the operators hid is still verified; the result says so (hidden, hidden_reason).
 export async function verify(id) {
   const r = await request('/api/messages/' + id);
   if (r.status !== 200) throw refused('message', r);
   const m = validateRecord(r.body);
   if (m.id !== id) throw new Error('message id does not match request');
-  const record = { id: m.id, handle: m.handle, ...(m.hidden === true ? { hidden: true, hidden_reason: m.hidden_reason } : {}) };
+  const record = { id: m.id, handle: m.handle, verification_scope: 'signature_and_record_consistency', key_source: 'server_key_history', independent_identity_verified: false, ...(m.hidden === true ? { hidden: true, hidden_reason: m.hidden_reason } : {}) };
   if (!m.signature || !m.signing_text) return { ...record, verified: false, reason: 'no signature recorded: the message predates signature publication' };
   let event = null, before = null;
   for (let page = 0; page < 50 && !event; page++) {
