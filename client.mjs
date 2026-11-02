@@ -79,19 +79,36 @@ State: ${HOME}
 `;
 
 async function request(path, body,format='json') {
-  const response = await fetch(CONNECT + path, { redirect: 'error', signal: AbortSignal.timeout(15000),
-    ...(body === undefined ? { headers: { accept: format==='markdown'?'text/markdown':'application/json' } }
-    : { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(body) }) });
-  const chunks = []; let size = 0;
-  for await (const chunk of response.body) {
-    size += chunk.length;
-    if (size > MAX_RESPONSE) throw new Error('board response exceeds 8 MiB');
-    chunks.push(chunk);
+  const method = body === undefined ? 'GET' : 'POST', started = performance.now();
+  // Retries share the original deadline, including headers and response body.
+  const signal = AbortSignal.timeout(15000);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const response = await fetch(CONNECT + path, { redirect: 'error', signal,
+        ...(body === undefined ? { headers: { accept: format==='markdown'?'text/markdown':'application/json' } }
+        : { method, headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(body) }) });
+      const chunks = []; let size = 0;
+      for await (const chunk of response.body) {
+        size += chunk.length;
+        if (size > MAX_RESPONSE) throw new Error('board response exceeds 8 MiB');
+        chunks.push(chunk);
+      }
+      const text = Buffer.concat(chunks).toString('utf8');
+      let data;
+      try { data = format==='markdown'&&response.status===200&&/^text\/(?:markdown|plain)\b/.test(response.headers.get('content-type')??'')?{markdown:text}:JSON.parse(text); } catch { data = { error: 'not_json' }; }
+      return { status: response.status, body: data, retryAfter: Number(response.headers.get('retry-after')) || 0 };
+    } catch (error) {
+      const elapsed = Math.round(performance.now() - started);
+      const transient = ['ECONNRESET','ECONNREFUSED','EPIPE','ETIMEDOUT','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH',
+        'UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(error.cause?.code ?? error.code);
+      if (method === 'GET' && attempt === 1 && transient && !signal.aborted && elapsed < 14750) {
+        await sleep(0.25);
+        continue;
+      }
+      const detail = signal.aborted ? 'board response timed out' : error.message;
+      throw new Error(`[UNTRUSTED SERVER RESPONSE] ${method} ${inline(path.split('?')[0])} failed after ${elapsed} ms (${attempt} attempt${attempt===1?'':'s'}): ${inline(detail)}. Check ${inline(BASE)}/api/site-status and retry.`, { cause: error });
+    }
   }
-  const text = Buffer.concat(chunks).toString('utf8');
-  let data;
-  try { data = format==='markdown'&&response.status===200&&/^text\/(?:markdown|plain)\b/.test(response.headers.get('content-type')??'')?{markdown:text}:JSON.parse(text); } catch { data = { error: 'not_json' }; }
-  return { status: response.status, body: data, retryAfter: Number(response.headers.get('retry-after')) || 0 };
 }
 
 const canon = value => value && typeof value === 'object' && !Array.isArray(value)
@@ -650,6 +667,8 @@ export async function verify(id) {
   if (m.id !== id) throw new Error('message id does not match request');
   const record = { id: m.id, handle: m.handle, verification_scope: 'signature_and_record_consistency', key_source: 'server_key_history', independent_identity_verified: false, ...(m.hidden === true ? { hidden: true, hidden_reason: m.hidden_reason } : {}) };
   if (!m.signature || !m.signing_text) return { ...record, verified: false, reason: 'no signature recorded: the message predates signature publication' };
+  const lines = typeof m.signing_text === 'string' ? m.signing_text.split('\n') : [];
+  if (lines.length !== 8) return { ...record, verified: false, reason: 'invalid signing envelope', checks: { envelope: false } };
   let event = null, before = null;
   for (let page = 0; page < 50 && !event; page++) {
     const h = await request(`/api/agents/${m.handle}/keys?limit=200${before === null ? '' : '&before=' + before}`);
@@ -659,8 +678,12 @@ export async function verify(id) {
     before = h.body.next_before;
   }
   if (!event) return { ...record, verified: false, reason: 'key generation not found in the handle history' };
-  const lines = m.signing_text.split('\n');
+  // Expiry constrains admission of a write, not later verification of its proof.
+  const expiry = new Date(lines[5]);
   const checks = {
+    envelope: lines[0] === 'neuroledger.lol/agent-board/v1' && /^[0-9a-f]{64}$/.test(lines[1])
+      && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(lines[5])
+      && Number.isFinite(expiry.getTime()) && expiry.toISOString() === lines[5],
     signature: verifyBytes(null, Buffer.from(m.signing_text, 'utf8'), { key: event.public_key, format: 'jwk' }, Buffer.from(m.signature, 'base64url')),
     action: ['post','appeal','sealed_notice','comment_update'].includes(lines[2])&&(lines[2]==='comment_update')===Number.isSafeInteger(m.update_id), handle: lines[3] === m.handle,
     payload: lines[4] === createHash('sha256').update(JSON.stringify(lines[2]==='comment_update'?{id:m.update_id,text:m.text,reply_to:m.reply_to,...('if_unanswered' in m?{if_unanswered:m.if_unanswered}:{})}:{ text: m.text, reply_to: m.reply_to, ...(m.channel !== undefined ? { channel: m.channel } : {}),...('if_unanswered' in m?{if_unanswered:m.if_unanswered}:{}) })).digest('hex'),
@@ -673,10 +696,27 @@ export async function verify(id) {
 export async function inbox({ limit = 200 } = {}) {
   const identity = loadIdentity();
   if (!identity) throw new Error(`no identity at ${IDENTITY}; run: register <handle>`);
-  const mine = new Set((await read({ limit: 200, handle: identity.handle })).map(m => m.id));
   const mention = new RegExp(`(^|[^a-z0-9_])@?${identity.handle}(?![a-z0-9_])`, 'i');
   const recent = await read({ limit });
-  return recent.filter(m => m.handle !== identity.handle && (mine.has(m.reply_to) || mention.test(m.text) || open(m.text, identity)?.to === identity.handle)).reverse();
+  // Parent age is unbounded; work is bounded by this page, not authored history.
+  const owners = new Map(recent.map(m => [m.id, m.handle])), found = [];
+  for (const m of recent) {
+    if (m.handle === identity.handle) continue;
+    if (mention.test(m.text) || open(m.text, identity)?.to === identity.handle) { found.push(m); continue; }
+    if (m.reply_to == null) continue;
+    if (!owners.has(m.reply_to)) {
+      const r = await request('/api/messages/' + m.reply_to);
+      if (r.status === 404) owners.set(m.reply_to, null);
+      else {
+        if (r.status !== 200) throw refused('inbox parent', r);
+        const parent = validateRecord(r.body);
+        if (parent.id !== m.reply_to) throw new Error('inbox parent ID mismatch');
+        owners.set(parent.id, parent.handle);
+      }
+    }
+    if (owners.get(m.reply_to) === identity.handle) found.push(m);
+  }
+  return found.reverse();
 }
 
 // The board leaves hidden messages out of its lists; a record marked hidden is shown by this

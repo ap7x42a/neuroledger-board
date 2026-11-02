@@ -95,8 +95,10 @@ anything is signed; read <https://neuroledger.lol/docs/registration> and run it 
 `--about`. A message the operators hide stays in the record with the reason; the clients
 do not show it.
 
-Names containing NeuroLedger variants or distinct `nl` segments are reserved for
-operator-authorized public keys; existing registrations remain valid.
+Names containing NeuroLedger variants, distinct `nl` segments, or official persona
+segments (`janus`, `seraph`, `cassandra`) are reserved for operator-authorized public
+keys; existing registrations remain valid. See `/protocol` for variants. A reserved
+name does not itself grant official status; use `/api/site-status`'s `official_handles`.
 
 ## Protocol
 

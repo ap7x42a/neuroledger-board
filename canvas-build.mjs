@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Local data-only build journal. The server receives signed runs, never a script.
 import { createHash,randomUUID } from 'node:crypto';
-import { constants,openSync,closeSync,readSync,writeFileSync,fsyncSync,fstatSync,lstatSync,mkdirSync,renameSync,unlinkSync,realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { constants,openSync,closeSync,readSync,writeFileSync,fsyncSync,fstatSync,lstatSync,mkdirSync,renameSync,unlinkSync,realpathSync,linkSync,readdirSync,rmdirSync } from 'node:fs';
+import { join,dirname,basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BASE,HOME,loadIdentity,readCanvas,previewCanvas,paintCanvas,canvasBatch,safeDisplay } from './client.mjs';
 
@@ -29,18 +29,68 @@ function save(path,value) {
   try{writeFileSync(fd,data);fsyncSync(fd);}finally{closeSync(fd);}
   try{renameSync(temp,path);}catch(e){unlinkSync(temp);throw e;}
 }
+const sameFile=(a,b)=>a&&b&&a.ino===b.ino&&a.dev===b.dev;
+const lockToken=token=>typeof token==='string'&&/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(token);
+function ownerAlive(pid) {
+  if(!integer(pid,1))throw new Error('Invalid build lock owner; inspect it locally.');
+  try{process.kill(pid,0);return true;}catch(e){if(e.code==='ESRCH')return false;throw e;}
+}
+function publishLock(path) {
+  // Publish complete owner metadata atomically: death during writing leaves only
+  // an unreferenced unique temp, never an ownerless lock or reaper marker.
+  const token=randomUUID(),temp=path+'.'+token+'.tmp',fd=openSync(temp,'wx',0o600);
+  let stat;
+  try{writeFileSync(fd,JSON.stringify({pid:process.pid,token}));fsyncSync(fd);stat=fstatSync(fd);linkSync(temp,path);}
+  finally{try{closeSync(fd);}finally{unlinkSync(temp);}}
+  let released=false;
+  return ()=>{
+    if(released)return;released=true;
+    if(sameFile(exists(path),stat)&&readJSON(path,1024).token===token)unlinkSync(path);
+  };
+}
+function claimReaper(path) {
+  // Unique intent names carry ownership at mkdir's atomic publication point.
+  // Every contender publishes BEFORE scanning. Overlap can make both retry,
+  // but cannot let both enter; a later starter sees the incumbent's live claim.
+  // Dead claims are never reused, so their removal needs no recursive lock.
+  const directory=dirname(path),prefix=basename(path)+'.reaper-',name=prefix+process.pid+'-'+randomUUID(),mine=join(directory,name);
+  mkdirSync(mine,{mode:0o700});
+  try{
+    for(const entry of readdirSync(directory)){
+      if(entry===name||!entry.startsWith(prefix))continue;
+      const match=/^(\d+)-(.+)$/.exec(entry.slice(prefix.length));
+      if(!match||!lockToken(match[2]))throw new Error('Invalid build reaper claim; inspect it locally.');
+      if(ownerAlive(Number(match[1])))throw new Error('Build is locked by another running reaper.');
+      try{rmdirSync(join(directory,entry));}catch(e){if(e.code!=='ENOENT')throw e;}
+    }
+  }catch(e){rmdirSync(mine);throw e;}
+  return ()=>rmdirSync(mine);
+}
 function lock(path) {
   const old=exists(path);
-  if(old){
-    const owner=readJSON(path,1024);if(!integer(owner.pid,1))throw new Error('Invalid build lock; inspect it locally.');
-    let alive=true;try{process.kill(owner.pid,0);}catch(e){if(e.code==='ESRCH')alive=false;else throw e;}
-    if(alive)throw new Error('Build is locked by another running process.');
-    // One reaper per observed inode: two starters cannot unlink each other's new lock.
-    const reap=path+'.'+old.ino+'.reap',fd=openSync(reap,'wx',0o600);closeSync(fd);
-    try{const current=lstatSync(path);if(current.ino!==old.ino)throw new Error('Build lock changed; retry.');unlinkSync(path);}finally{unlinkSync(reap);}
-  }
-  const fd=openSync(path,'wx',0o600),stat=fstatSync(fd);writeFileSync(fd,JSON.stringify({pid:process.pid}));closeSync(fd);
-  return ()=>{const current=exists(path);if(current?.ino===stat.ino)unlinkSync(path);};
+  if(!old)return publishLock(path);
+  const owner=readJSON(path,1024);
+  if(ownerAlive(owner.pid))throw new Error('Build is locked by another running process.');
+  const releaseClaim=claimReaper(path);let releaseReaper;
+  try{
+    // Keep the legacy inode-scoped marker to exclude older helpers too. An old
+    // empty marker has no provable owner: leave it for explicit local inspection.
+    const reap=path+'.'+old.ino+'.reap',previous=exists(reap);
+    if(previous){
+      let reaper;try{reaper=readJSON(reap,1024);}catch(e){if(e instanceof SyntaxError)throw new Error('Unowned legacy build reaper; stop old helpers and inspect it locally.');throw e;}
+      if(!lockToken(reaper.token))throw new Error('Invalid build reaper owner; inspect it locally.');
+      if(ownerAlive(reaper.pid))throw new Error('Build is locked by another running reaper.');
+      if(!sameFile(exists(reap),previous))throw new Error('Build reaper changed; retry.');
+      unlinkSync(reap);
+    }
+    releaseReaper=publishLock(reap);
+    if(!sameFile(exists(path),old))throw new Error('Build lock changed; retry.');
+    const current=readJSON(path,1024);
+    if(current.pid!==owner.pid||current.token!==owner.token)throw new Error('Build lock changed; retry.');
+    if(ownerAlive(current.pid))throw new Error('Build is locked by another running process.');
+    unlinkSync(path);
+    return publishLock(path);
+  }finally{try{releaseReaper?.();}finally{releaseClaim();}}
 }
 function validatePlan(plan) {
   if(!fields(plan,['version','runs'])||plan.version!==1||!Array.isArray(plan.runs)||!plan.runs.length||plan.runs.length>MAX_RUNS)throw new Error('Invalid drawing plan: use version 1 and 1–262144 runs only.');

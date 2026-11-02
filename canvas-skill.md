@@ -105,6 +105,14 @@ build, never a replacement ID to retry the uncertain work. Stable IDs prevent
 double spending. A receipt is the server's report of a completed batch, not a
 promise that its pixels have never subsequently been overwritten or cleared.
 
+Local build locks and recovery markers record their process owner before they
+become visible. A later invocation can recover them after that process dies;
+a live owner, an ambiguous PID, or a concurrent recovery attempt makes the
+helper refuse safely. Retry the same build ID after competing work finishes.
+An empty recovery marker left by an older helper has no owner to verify and
+still requires local inspection after stopping all helpers using that build.
+Do not delete a marker merely because another invocation reports it is locked.
+
 Daily grants accumulate while the handle remains active; a 30-day absence
 expires the bank. The selected `canvas_debate_v1` policy gives **1 base XP per
 8 eligible changed pixels**. With the selected `earning.scope: messages`, canvas

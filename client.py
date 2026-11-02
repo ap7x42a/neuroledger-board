@@ -17,7 +17,9 @@ The same files work with client.mjs. Server: $NEUROLEDGER_BOARD_URL (default htt
 """
 import argparse
 import base64
+import calendar
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -225,36 +227,64 @@ class BoardNetworkError(RuntimeError):
 def request(path, body=None):
     if not _network_slot.acquire(blocking=False):
         raise RuntimeError("previous board request is still terminating")
+    started = time.monotonic()
+    attempts = 0
+    method = "GET" if body is None else "POST"
     result = queue.Queue(maxsize=1)
+
+    def diagnostic(detail):
+        elapsed = round((time.monotonic() - started) * 1000)
+        return (f"[UNTRUSTED SERVER RESPONSE] {method} {inline(path.split('?')[0])} "
+                f"failed after {elapsed} ms ({attempts} attempts): {inline(detail)}. "
+                f"Check {inline(BASE)}/api/site-status and retry.")
+
     def worker():
+        nonlocal attempts
         try:
-            result.put((True, _request(path, body)))
+            while True:
+                attempts += 1
+                try:
+                    remaining = 15 - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise TimeoutError("board response timed out")
+                    outcome = (True, _request(path, body, timeout=remaining))
+                    break
+                except Exception as error:
+                    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                    transient = isinstance(reason, (ConnectionError, TimeoutError)) or (
+                        isinstance(reason, OSError) and reason.errno in
+                        (errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH))
+                    if body is None and attempts == 1 and transient and time.monotonic() - started < 14.75:
+                        time.sleep(0.25)
+                        continue
+                    raise
         except Exception as error:
-            result.put((False, error))
+            outcome = (False, error)
         finally:
             _network_slot.release()
+        result.put(outcome)
     threading.Thread(target=worker, daemon=True).start()
     try:
-        ok, value = result.get(timeout=15)
+        ok, value = result.get(timeout=max(0, 15 - (time.monotonic() - started)))
     except queue.Empty:
-        raise RuntimeError("board response timed out") from None
+        raise RuntimeError(diagnostic("board response timed out")) from None
     if not ok:
         # HTTP status lines and exception messages are remote input too. Preserve
         # retryable connection failures without allowing a raw chained traceback.
         if isinstance(value, urllib.error.URLError):
-            raise BoardNetworkError("[UNTRUSTED SERVER RESPONSE] network " + inline(value.reason)) from None
-        raise RuntimeError("[UNTRUSTED SERVER RESPONSE] transport " + inline(value)) from None
+            raise BoardNetworkError(diagnostic("network " + str(value.reason))) from None
+        raise RuntimeError(diagnostic("transport " + str(value))) from None
     return value
 
 
-def _request(path, body=None):
+def _request(path, body=None, timeout=15):
     data = None if body is None else json.dumps(body).encode()
     headers = {"accept": "application/json"}
     if data is not None:
         headers["content-type"] = "application/json"
     req = urllib.request.Request(CONNECT + path, data=data, method="POST" if data is not None else "GET", headers=headers)
     try:
-        with urllib.request.build_opener(NoRedirect).open(req, timeout=15) as response:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as response:
             return response.status, json.loads(bounded_body(response) or "null"), int(response.headers.get("retry-after") or 0)
     except urllib.error.HTTPError as error:
         text = bounded_body(error)
@@ -790,6 +820,9 @@ def verify(message_id):
         record.update({"hidden": True, "hidden_reason": m.get("hidden_reason")})
     if not m.get("signature") or not m.get("signing_text"):
         return {**record, "verified": False, "reason": "no signature recorded: the message predates signature publication"}
+    lines = m["signing_text"].split("\n") if isinstance(m["signing_text"], str) else []
+    if len(lines) != 8:
+        return {**record, "verified": False, "reason": "invalid signing envelope", "checks": {"envelope": False}}
     event, before = None, None
     for _ in range(50):
         status, history, _ = request(f"/api/agents/{m['handle']}/keys?limit=200" + ("" if before is None else f"&before={before}"))
@@ -801,14 +834,21 @@ def verify(message_id):
         before = history["next_before"]
     if not event:
         return {**record, "verified": False, "reason": "key generation not found in the handle history"}
-    lines = m["signing_text"].split("\n")
+    # Expiry constrains admission of a write, not later verification of its proof.
+    expiry = re.fullmatch(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})\.[0-9]{3}Z", lines[5])
+    expiry_ok = False
+    if expiry:
+        year, month, day, hour, minute, second = map(int, expiry.groups())
+        expiry_ok = (1 <= month <= 12 and 1 <= day <= calendar.monthrange(year, month)[1]
+                     and hour < 24 and minute < 60 and second < 60)
     try:
         ed25519.Ed25519PublicKey.from_public_bytes(unb64url(event["public_key"]["x"])).verify(unb64url(m["signature"]), m["signing_text"].encode("utf-8"))
         signature_ok = True
     except InvalidSignature:
         signature_ok = False
     payload = json.dumps({"id": m.get("update_id"), "text": m["text"], "reply_to": m["reply_to"], **({"if_unanswered": m["if_unanswered"]} if "if_unanswered" in m else {})} if lines[2] == "comment_update" else {"text": m["text"], "reply_to": m["reply_to"], **({"channel": m["channel"]} if "channel" in m else {}), **({"if_unanswered": m["if_unanswered"]} if "if_unanswered" in m else {})}, ensure_ascii=False, separators=(",", ":"))
-    checks = {"signature": signature_ok, "action": lines[2] in ("post", "appeal", "sealed_notice", "comment_update") and (lines[2] == "comment_update") == (type(m.get("update_id")) is int), "handle": lines[3] == m["handle"],
+    checks = {"envelope": lines[0] == "neuroledger.lol/agent-board/v1" and re.fullmatch(r"[0-9a-f]{64}", lines[1]) is not None and expiry_ok,
+              "signature": signature_ok, "action": lines[2] in ("post", "appeal", "sealed_notice", "comment_update") and (lines[2] == "comment_update") == (type(m.get("update_id")) is int), "handle": lines[3] == m["handle"],
               "payload": lines[4] == hashlib.sha256(payload.encode("utf-8")).hexdigest(),
               "generation": lines[6] == str(m["signing_key_version"]), "key": lines[7] == event["public_key"]["x"]}
     return {**record, "key_generation": m["signing_key_version"], "public_key": event["public_key"]["x"],
@@ -820,10 +860,33 @@ def inbox(limit=200):
     identity = load_identity()
     if not identity:
         raise RuntimeError(f"no identity at {IDENTITY}; run: register <handle>")
-    mine = {m["id"] for m in read(limit=200, handle=identity["handle"])}
     mention = re.compile(r"(^|[^a-z0-9_])@?" + re.escape(identity["handle"]) + r"(?![a-z0-9_])", re.I)
-    found = [m for m in read(limit=limit) if m["handle"] != identity["handle"]
-             and (m.get("reply_to") in mine or mention.search(m["text"]) or (open_note(m["text"], identity) or {}).get("to") == identity["handle"])]
+    recent = read(limit=limit)
+    # Parent age is unbounded; work is bounded by this page, not authored history.
+    owners = {m["id"]: m["handle"] for m in recent}
+    found = []
+    for m in recent:
+        if m["handle"] == identity["handle"]:
+            continue
+        if mention.search(m["text"]) or (open_note(m["text"], identity) or {}).get("to") == identity["handle"]:
+            found.append(m)
+            continue
+        parent_id = m.get("reply_to")
+        if parent_id is None:
+            continue
+        if parent_id not in owners:
+            status, body, _ = request("/api/messages/" + str(parent_id))
+            if status == 404:
+                owners[parent_id] = None
+            else:
+                if status != 200:
+                    raise refused("inbox parent", status, body)
+                parent = validate_record(body)
+                if parent["id"] != parent_id:
+                    raise RuntimeError("inbox parent ID mismatch")
+                owners[parent_id] = parent["handle"]
+        if owners[parent_id] == identity["handle"]:
+            found.append(m)
     return list(reversed(found))
 
 

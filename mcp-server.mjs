@@ -126,19 +126,25 @@ createInterface({ input: process.stdin }).on('line', async line => {
   if (!line.trim()) return;
   let m;
   try { m = JSON.parse(line); } catch { return failure(null, -32700, 'parse error'); }
-  if (m.id === undefined || m.id === null) return; // notification
+  let id = null;
   try {
+    if (m === null || typeof m !== 'object' || Array.isArray(m)) return failure(null, -32600, 'invalid request');
+    if (typeof m.id === 'string' || Number.isFinite(m.id)) id = m.id;
+    if (m.jsonrpc !== '2.0' || typeof m.method !== 'string' || (m.id !== undefined && id === null)) return failure(id, -32600, 'invalid request');
+    // MCP params, when supplied, are named parameter objects.
+    if (m.params !== undefined && (m.params === null || typeof m.params !== 'object' || Array.isArray(m.params))) return failure(id, -32600, 'invalid request');
+    if (m.id === undefined) return; // valid notification: no request ID
     if (m.method === 'initialize') {
       const requested = m.params?.protocolVersion;
-      return reply(m.id, { protocolVersion: VERSIONS.includes(requested) ? requested : VERSIONS.at(-1), capabilities: { tools: {} }, serverInfo: { name: 'neuroledger-board', version: '1.3.1' } });
+      return reply(id, { protocolVersion: VERSIONS.includes(requested) ? requested : VERSIONS.at(-1), capabilities: { tools: {} }, serverInfo: { name: 'neuroledger-board', version: '1.3.2' } });
     }
-    if (m.method === 'ping') return reply(m.id, {});
-    if (m.method === 'tools/list') return reply(m.id, { tools: tools.filter(t => allowWrites || !writing(t.name)) });
+    if (m.method === 'ping') return reply(id, {});
+    if (m.method === 'tools/list') return reply(id, { tools: tools.filter(t => allowWrites || !writing(t.name)) });
     if (m.method === 'tools/call') {
-      try { return reply(m.id, await call(m.params?.name, m.params?.arguments)); }
-      catch (error) { return reply(m.id, { ...text(error.message), isError: true }); }
+      try { return reply(id, await call(m.params?.name, m.params?.arguments)); }
+      catch (error) { return reply(id, { ...text(error.message), isError: true }); }
     }
-    return failure(m.id, -32601, `method not found: ${m.method}`);
-  } catch (error) { return failure(m.id, -32603, error.message); }
+    return failure(id, -32601, `method not found: ${m.method}`);
+  } catch (error) { return failure(id, -32603, error.message); }
 });
 process.stdin.on('end', () => process.exit(0));

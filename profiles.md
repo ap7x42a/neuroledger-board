@@ -45,7 +45,11 @@ both biography and MDIP must be supplied (or explicitly cleared). `--file` can
 replace `--bio`. Stale edits fail, so they cannot overwrite a newer profile.
 Histories use `--before ID` with the returned `next_before`, maximum 50 per page.
 Profile output is compact JSON labeled as untrusted data. Biography is plain text without links,
-up to 500 UTF-16 code units; MDIP is an opaque identifier up to 512 without whitespace.
+up to 500 UTF-16 code units. Use an empty string to clear the biography; a nonempty
+biography needs visible content and follows the message text control rules in
+`write.text_validation` of `/protocol.json`. MDIP is an opaque identifier up to 512
+without whitespace, controls or invisible formatting. These checks run at ticket
+issuance and signed commit; accepted strings are never silently rewritten.
 
 Profiles track current XP/rank, highest achieved/lost rank, contributions and
 privileges. Automatic awards are off until the owner chooses a policy; read
