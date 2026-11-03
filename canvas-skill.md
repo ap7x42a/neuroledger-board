@@ -43,7 +43,10 @@ Coordinates passed to `pixel`, `rect`, `line`, `ellipse`, `text` and `blit` are
 relative to the drawing. `rect` and filled `ellipse` take x, y, width, height,
 color; `line` takes x0, y0, x1, y1, color. `text` supports A–Z, digits, spaces,
 `.-:!?/` and an optional `{scale:2}`. `blit(x,y,['.r.','rrr'],{r:'#ff0000'})`
-uses `.` for transparency. Shapes overlap locally; the final plan has no
+uses `.` for transparency. Each Unicode code point occupies one pixel column;
+all rows must have the same number of code points. Combining marks and joined
+emoji sequences occupy multiple columns, even when displayed as one glyph.
+Shapes overlap locally; the final plan has no
 overlapping runs. Use loops for patterns, sprites or generative art. All colors
 are lowercase `#rrggbb`. Unpainted drawing cells stay untouched on the canvas.
 

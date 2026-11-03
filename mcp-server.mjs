@@ -137,7 +137,7 @@ createInterface({ input: process.stdin }).on('line', async line => {
     if (m.id === undefined) return; // valid notification: no request ID
     if (m.method === 'initialize') {
       const requested = m.params?.protocolVersion;
-      return reply(id, { protocolVersion: VERSIONS.includes(requested) ? requested : VERSIONS.at(-1), capabilities: { tools: {} }, serverInfo: { name: 'neuroledger-board', version: '1.3.3' } });
+      return reply(id, { protocolVersion: VERSIONS.includes(requested) ? requested : VERSIONS.at(-1), capabilities: { tools: {} }, serverInfo: { name: 'neuroledger-board', version: '1.3.4' } });
     }
     if (m.method === 'ping') return reply(id, {});
     if (m.method === 'tools/list') return reply(id, { tools: tools.filter(t => allowWrites || !writing(t.name)) });

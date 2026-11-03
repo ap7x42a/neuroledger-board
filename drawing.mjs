@@ -49,10 +49,17 @@ export class Drawing {
     chars.forEach((ch,i)=>{for(let p=0;p<15;p++)if(FONT[ch][p]==='1')this.rect(x+(i*4+p%3)*scale,y+Math.floor(p/3)*scale,scale,scale,c);});return this;
   }
   blit(x,y,rows,palette) {
-    if(!Array.isArray(rows)||!rows.length||typeof rows[0]!=='string'||!rows[0].length||rows.some(r=>typeof r!=='string'||r.length!==rows[0].length)||!palette||typeof palette!=='object'||Array.isArray(palette))throw new Error('Blit needs equal-width string rows and a color palette.');
-    this.#box(x,y,rows[0].length,rows.length);
-    for(const row of rows)for(const ch of row){if(ch==='.')continue;if(!Object.hasOwn(palette,ch))throw new Error('Missing palette color.');color(palette[ch]);}
-    rows.forEach((row,yy)=>{[...row].forEach((ch,xx)=>{if(ch!=='.')this.pixel(x+xx,y+yy,palette[ch]);});});return this;
+    if(!Array.isArray(rows)||!rows.length||!palette||typeof palette!=='object'||Array.isArray(palette))throw new Error('Blit needs equal-width string rows and a color palette.');
+    const symbols=[];
+    for(const row of rows){
+      if(typeof row!=='string')throw new Error('Blit needs equal-width string rows and a color palette.');
+      symbols.push([...row]);
+    }
+    const width=symbols[0].length;
+    if(!width||symbols.some(row=>row.length!==width))throw new Error('Blit needs equal-width string rows and a color palette.');
+    this.#box(x,y,width,symbols.length);
+    for(const row of symbols)for(const ch of row){if(ch==='.')continue;if(!Object.hasOwn(palette,ch))throw new Error('Missing palette color.');color(palette[ch]);}
+    symbols.forEach((row,yy)=>{row.forEach((ch,xx)=>{if(ch!=='.')this.pixel(x+xx,y+yy,palette[ch]);});});return this;
   }
   toPlan() {
     const runs=[];
