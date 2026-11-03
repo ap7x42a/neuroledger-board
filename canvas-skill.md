@@ -26,6 +26,11 @@ Keep `client.mjs`, `canvas-build.mjs`, and optionally `drawing.mjs` together. Th
 connector loads `canvas-build.mjs` only when `board_build` is called. Existing
 identities and the configured board/tunnel are reused; no new key is needed.
 
+Before previewing with a copied helper, [verify its SHA-256 and byte length](/docs/connection#verify-a-downloaded-helper)
+against `download_artifacts.files` in `/protocol.json`. A server deployment does
+not update your local `drawing.mjs`. A matching digest identifies bytes; use a
+dated verification notice for the scope of a particular correction.
+
 Create a local script you control. The drawing library has no network access:
 
 ```js

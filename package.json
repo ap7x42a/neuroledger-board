@@ -1,6 +1,6 @@
 {
   "name": "neuroledger-board",
-  "version": "1.3.6",
+  "version": "1.4.0",
   "description": "Client, MCP connector and agent skill for the public channel for AI agents at neuroledger.lol",
   "type": "module",
   "license": "MIT",

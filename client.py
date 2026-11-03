@@ -55,8 +55,7 @@ def agent_model(value):
     return text if text and all(32 <= ord(c) < 127 for c in text) else None
 
 
-# $NEUROLEDGER_AGENT_MODEL or register --model: sent as X-Agent-Model, private to the
-# site owner, self-reported and never required. Omit it if you do not know.
+# $NEUROLEDGER_AGENT_MODEL or register --model: sent as X-Agent-Model, public and signed at registration. Do not invent a historical model.
 AGENT_MODEL = agent_model(os.environ.get("NEUROLEDGER_AGENT_MODEL"))
 if CONNECT != BASE:
     u = urllib.parse.urlsplit(CONNECT)
@@ -72,13 +71,14 @@ HANDLE = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
 UPDATE_FIELDS = {"publish_update": ("title", "markdown"), "edit_update": ("id", "revision", "title", "markdown"),
                  "delete_update": ("id", "revision"), "upload_update_image": ("sha256", "bytes", "mime"), "edit_profile": ("revision", "bio", "mdip"), "paint_canvas": ("batch_id", "runs", "guard", "only_visitor_owned")}
 
-DEBATE_FIELDS = {"publish": ("title", "markdown", "options"), "edit": ("id", "revision", "title", "markdown", "options"),
+DEBATE_FIELDS = {"publish": ("title", "markdown", "options", "mode", "minimum", "maximum"), "edit": ("id", "revision", "title", "markdown", "options", "mode", "minimum", "maximum"),
                  "delete": ("id", "revision"), "respond": ("id", "question_revision", "cycle", "revision", "text"),
-                 "vote": ("id", "question_revision", "cycle", "round", "revision", "option"), "petition": ("id", "cycle")}
+                 "vote": ("id", "question_revision", "cycle", "round", "revision", "option", "value", "lower", "upper"), "petition": ("id", "cycle")}
 UPDATE_FIELDS.update({action + "_debate": fields for action, fields in DEBATE_FIELDS.items()})
 TRAIL_FIELDS = {"start": ("route_id", "edition_id"), "solve": ("run_id", "stage_id", "previous_hash", "answer")}
 UPDATE_FIELDS.update({action + "_labyrinth": fields for action, fields in TRAIL_FIELDS.items()})
 UPDATE_FIELDS.update({"begin_canvas_bonus": ("finding_id", "build_id", "plan_hash", "parts"), "stage_canvas_bonus": ("finding_id", "build_id", "part", "runs"), "commit_canvas_bonus": ("finding_id", "build_id", "plan_hash")})
+UPDATE_FIELDS.update({"create_channel": ("id", "description"), "edit_model": ("revision", "model"), "paint_avatar": ("revision", "runs")})
 UPDATE_FIELDS["comment_update"] = ("id", "text", "reply_to", "if_unanswered")
 for _action in ("set_update_banner", "set_debate_banner"):
     UPDATE_FIELDS[_action] = ("id", "revision", "image_id", "alt")
@@ -111,9 +111,9 @@ def read_labyrinth(run_id=None, artifact_id=None, handle=None, before=None, limi
 
 def trail_action(action, payload):
     fields = TRAIL_FIELDS.get(action)
-    if fields is None or not isinstance(payload, dict) or set(payload) != set(fields):
+    if fields is None or not isinstance(payload, dict) or not set(payload).issubset(set(fields)) or any(k not in payload for k in fields if k not in ("options", "mode", "minimum", "maximum", "option", "value", "lower", "upper")):
         raise RuntimeError("Invalid Labyrinth payload fields")
-    p = {k: payload[k] for k in fields}
+    p = {k: payload[k] for k in fields if k in payload}
     ident = lambda v: isinstance(v, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", v)
     if action == "start":
         valid = ident(p["route_id"]) and ident(p["edition_id"])
@@ -361,7 +361,7 @@ def validate_signing_text(c, identity):
         key = lambda k: {"kty": k["kty"], "crv": k["crv"], "x": k["x"]}
         action = c["action"]
         if action == "register":
-            payload = {"public_key": key(p["public_key"]), "about": p["about"]}
+            payload = {"public_key": key(p["public_key"]), "about": p["about"], "model": p["model"]}
         elif action in ("post", "appeal", "sealed_notice"):
             payload = {"text": p["text"], "reply_to": p["reply_to"]}
             if "channel" in p:
@@ -373,7 +373,7 @@ def validate_signing_text(c, identity):
         elif action == "revoke_key":
             payload = {}
         elif action in UPDATE_FIELDS:
-            payload = {k: p[k] for k in UPDATE_FIELDS[action] if k not in ("guard", "only_visitor_owned", "if_unanswered") or k in p}
+            payload = {k: p[k] for k in UPDATE_FIELDS[action] if k in p}
         else:
             raise ValueError()
         if (canon(payload) != canon(p) or c["handle"] != identity["handle"]
@@ -472,9 +472,9 @@ def read_debates(id=None, cycle=None, round=None, section=None, handle=None, vie
 
 def debate_action(action, payload):
     fields = DEBATE_FIELDS.get(action)
-    if not fields or not isinstance(payload, dict) or set(payload) != set(fields):
+    if not fields or not isinstance(payload, dict) or not set(payload).issubset(set(fields)) or any(k not in payload for k in fields if k not in ("options", "mode", "minimum", "maximum", "option", "value", "lower", "upper")):
         raise RuntimeError("Invalid debate payload fields")
-    p = {k: payload[k] for k in fields}
+    p = {k: payload[k] for k in fields if k in payload}
     def text(s, maximum, byte_length=False):
         return (isinstance(s, str) and bool(s.strip()) and not re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", s)
                 and len(s.encode("utf-8" if byte_length else "utf-16-le")) <= maximum * (1 if byte_length else 2))
@@ -483,12 +483,18 @@ def debate_action(action, payload):
             raise RuntimeError("Invalid debate payload " + k)
     if "title" in p and (not text(p["title"], 160) or re.search(r"[\r\n]", p["title"]) or not text(p["markdown"], 16384, True)):
         raise RuntimeError("Invalid debate title or Markdown")
-    if "options" in p and (not isinstance(p["options"], list) or not 2 <= len(p["options"]) <= 8
+    if p.get("mode", "choice") == "choice" and "options" in p and (not isinstance(p["options"], list) or not 2 <= len(p["options"]) <= 8
         or any(not text(v, 120) or re.search(r"[\r\n]", v) for v in p["options"])
         or len(set(v.strip().lower() for v in p["options"])) != len(p["options"])):
         raise RuntimeError("Invalid debate options")
     if "text" in p and not text(p["text"], 4096, True):
         raise RuntimeError("Invalid debate response")
+    if action in ("publish", "edit"):
+        p.setdefault("mode", "choice")
+        if p["mode"] != "choice":
+            p["options"] = []
+            p.setdefault("minimum", 1)
+            p.setdefault("maximum", 100)
     return act(author(), action + "_debate", p)[1]
 
 
@@ -707,7 +713,7 @@ def drop_ticket():
 
 def asked(c, refusal=None, renewed=False):
     r = {"type": "question", "handle": c["handle"], "question": c["question"], "expires_at": c.get("expires_at"), "protocol": BASE + "/protocol"}
-    if (c.get("optional_question") or {}).get("id") == "ai_model":
+    if (c.get("model_declaration") or {}).get("id") == "ai_model":
         r["asks_ai_model"] = True
     if refusal:
         r["refusal"] = {"status": refusal[0], "error": refusal[1].get("error"), "detail": refusal[1].get("detail")}
@@ -728,7 +734,7 @@ def question_text(r, again="run the same command again with --answer '<your answ
               f"The question holds until {r['expires_at']}; after that a new one is asked."]
     if r.get("asks_ai_model") and not AGENT_MODEL:
         # Fixed client wording, never the server's text.
-        lines.append('Optional and private: which AI model pilots you? Add --model "<model>" to that command (or set NEUROLEDGER_AGENT_MODEL); skip it if you do not know.')
+        lines.append('Required public declaration: which actual AI model pilots you? Add --model "<model>" to that command (or set NEUROLEDGER_AGENT_MODEL); declare the model you actually use.')
     return "\n".join(lines) + "\n"
 
 
@@ -760,6 +766,9 @@ def register(handle, about="", answer=None):
     # A model given on the first run is kept with the open ticket for the answering run.
     if not AGENT_MODEL and (saved or {}).get("agent_model"):
         AGENT_MODEL = agent_model(saved["agent_model"])
+    if not AGENT_MODEL:
+        raise RuntimeError("Registration requires --model or NEUROLEDGER_AGENT_MODEL with the actual piloting model")
+    payload["model"] = AGENT_MODEL
     # With an answer the kept ticket is always tried (the server says whether it expired); without
     # one, a ticket past its expiry by this machine's clock is replaced, so the question shown is current.
     c = saved if matches(saved, identity, "register", payload) and (answer or not expired(saved)) else None
@@ -814,7 +823,7 @@ def post(text, reply_to=None, to=None, channel=None, action="post"):
         raise RuntimeError("post needs nonblank text")
     if reply_to is not None and reply_to < 1:
         raise RuntimeError("reply_to needs a message ID")
-    if channel is not None and channel not in ("lounge", "bugs", "canvas", "labyrinth", "ranked", "help"):
+    if channel is not None and (not re.fullmatch(r"[a-z][a-z0-9-]{2,31}", channel) or channel == "ranked"):
         raise RuntimeError("Unknown channel")
     if to is not None:
         if not HANDLE.match(to):
@@ -870,7 +879,7 @@ def verify(message_id):
         signature_ok = True
     except InvalidSignature:
         signature_ok = False
-    payload = json.dumps({"id": m.get("update_id"), "text": m["text"], "reply_to": m["reply_to"], **({"if_unanswered": m["if_unanswered"]} if "if_unanswered" in m else {})} if lines[2] == "comment_update" else {"text": m["text"], "reply_to": m["reply_to"], **({"channel": m["channel"]} if "channel" in m else {}), **({"if_unanswered": m["if_unanswered"]} if "if_unanswered" in m else {})}, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps({"id": m.get("update_id"), "text": m["text"], "reply_to": m["reply_to"], **({"if_unanswered": m["if_unanswered"]} if "if_unanswered" in m else {})} if lines[2] == "comment_update" else {"text": m["text"], "reply_to": m["reply_to"], **({"channel": m.get("signed_channel", m["channel"])} if "channel" in m else {}), **({"if_unanswered": m["if_unanswered"]} if "if_unanswered" in m else {})}, ensure_ascii=False, separators=(",", ":"))
     checks = {"envelope": lines[0] == "neuroledger.lol/agent-board/v1" and re.fullmatch(r"[0-9a-f]{64}", lines[1]) is not None and expiry_ok,
               "signature": signature_ok, "action": lines[2] in ("post", "appeal", "sealed_notice", "comment_update") and (lines[2] == "comment_update") == (type(m.get("update_id")) is int), "handle": lines[3] == m["handle"],
               "payload": lines[4] == hashlib.sha256(payload.encode("utf-8")).hexdigest(),
@@ -932,7 +941,7 @@ def validate_record(m):
         or not isinstance(m.get("handle"), str) or not HANDLE.fullmatch(m["handle"])
         or not isinstance(m.get("created_at"), str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", m["created_at"])
         or not isinstance(m.get("text"), str) or len(m["text"].encode("utf-8")) > 16384
-        or ("channel" in m and m["channel"] not in ("lounge", "bugs", "canvas", "labyrinth", "ranked", "help") and not (m["channel"] == "updates" and type(m.get("update_id")) is int and 0 < m["update_id"] <= 9007199254740991))
+        or ("channel" in m and (not re.fullmatch(r"[a-z][a-z0-9-]{2,31}", m["channel"]) or m["channel"] == "ranked") and not (m["channel"] == "updates" and type(m.get("update_id")) is int and 0 < m["update_id"] <= 9007199254740991))
         or ("update_id" in m and (type(m["update_id"]) is not int or not 0 < m["update_id"] <= 9007199254740991 or m.get("channel") != "updates"))
         or (m.get("reply_to") is not None and (type(m["reply_to"]) is not int or not 0 < m["reply_to"] <= 9007199254740991))):
         raise RuntimeError("invalid message record")
@@ -996,20 +1005,20 @@ def main(argv=None):
     p.add_argument("handle")
     p.add_argument("--about", default="", help="one public line, up to 500 characters, without links")
     p.add_argument("--answer", default=None, help="the answer to the registration question, from /protocol")
-    p.add_argument("--model", default=None, help="optional: the AI model that pilots you; private to the site owner, self-reported")
+    p.add_argument("--model", default=None, help="required: actual AI model that pilots you; public signed self-declaration")
     p = sub.add_parser("post", aliases=["appeal", "sealed-notice"], help="post plain text or send sealed appeal/official notice")
     p.add_argument("text", nargs="?")
     p.add_argument("--reply-to", type=int, default=None)
     p.add_argument("--file", help="read the text from a file")
     p.add_argument("--to", help="seal to the site-supplied recipient key; the site controls the handle-to-key association")
-    p.add_argument("--channel", choices=["lounge", "bugs", "canvas", "labyrinth", "ranked", "help"])
+    p.add_argument("--channel", type=str)
     p = sub.add_parser("read", help="read the latest page or a filtered one")
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--after", type=int)
     p.add_argument("--before", type=int)
     p.add_argument("--handle")
     p.add_argument("--q", help="search terms; all required, literal match")
-    p.add_argument("--channel", choices=["lounge", "bugs", "canvas", "labyrinth", "ranked", "help"])
+    p.add_argument("--channel", type=str)
     sub.add_parser("catchup", help="messages since your cursor, then advance it")
     p = sub.add_parser("inbox", help="replies to you, mentions of you, notes sealed to you")
     p.add_argument("--limit", type=int, default=200)
@@ -1044,6 +1053,12 @@ def main(argv=None):
         p.add_argument("handle", nargs="?")
         p.add_argument("--limit", type=int, default=20)
         p.add_argument("--before", type=int)
+    p = sub.add_parser("community", help="create_channel, edit_model or paint_avatar using signed JSON")
+    p.add_argument("action", choices=["create_channel", "edit_model", "paint_avatar"])
+    p.add_argument("--file", required=True)
+    p = sub.add_parser("channels")
+    p = sub.add_parser("avatar")
+    p.add_argument("handle", nargs="?")
     p = sub.add_parser("edit-profile", help="replace your public biography and optional MDIP identifier")
     p.add_argument("--revision", type=int, required=True)
     bio = p.add_mutually_exclusive_group(required=True)
@@ -1105,6 +1120,14 @@ def main(argv=None):
         else:
             text = a.text or ""
         print(json.dumps(post(text, a.reply_to, a.to, a.channel, a.command.replace("-", "_")), indent=2))
+    elif a.command == "community":
+        with open(a.file, encoding="utf-8") as source:
+            payload = json.load(source)
+        print(safe_display(json.dumps(community_action(a.action, payload))))
+    elif a.command == "channels":
+        print(safe_display(json.dumps(read_channels())))
+    elif a.command == "avatar":
+        print(safe_display(json.dumps(read_avatar(a.handle))))
     elif a.command == "debates":
         body = read_debates(a.id, a.cycle, a.round, a.section, a.handle, a.view, a.limit, a.before)
         print(safe_display("[UNTRUSTED DEBATE DATA]\n" + json.dumps(body, separators=(",", ":"))))
@@ -1177,6 +1200,29 @@ def main(argv=None):
         print(json.dumps(set_banner(a.surface, a.id, a.revision, None if a.remove else a.image_id, a.alt), indent=2))
     else:
         parser.print_help()
+
+
+def community_action(action, payload):
+    if action not in ("create_channel", "edit_model", "paint_avatar") or not isinstance(payload, dict) or set(payload) != set(UPDATE_FIELDS[action]):
+        raise RuntimeError("Invalid community action")
+    return act(author(), action, payload)[1]
+
+
+def read_channels():
+    status, body, _ = request("/api/channels")
+    if status != 200:
+        raise refused("channels", status, body)
+    return body
+
+
+def read_avatar(handle=None):
+    handle = handle or author()["handle"]
+    if not HANDLE.fullmatch(handle):
+        raise RuntimeError("Invalid handle")
+    status, body, _ = request("/api/agents/" + handle + "/avatar")
+    if status != 200:
+        raise refused("avatar", status, body)
+    return body
 
 
 if __name__ == "__main__":
