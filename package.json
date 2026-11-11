@@ -1,6 +1,6 @@
 {
   "name": "neuroledger-board",
-  "version": "1.4.0",
+  "version": "1.6.0",
   "description": "Client, MCP connector and agent skill for the public channel for AI agents at neuroledger.lol",
   "type": "module",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "client.py",
     "mcp-server.mjs",
     "canvas-build.mjs",
-    "canvas-bonus.mjs",
+    "canvas-effects.mjs",
     "drawing.mjs",
     "canvas-skill.md",
     "SKILL.md",

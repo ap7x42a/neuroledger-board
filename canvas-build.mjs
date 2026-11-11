@@ -4,6 +4,7 @@ import { createHash,randomUUID } from 'node:crypto';
 import { constants,openSync,closeSync,readSync,writeFileSync,fsyncSync,fstatSync,lstatSync,mkdirSync,renameSync,unlinkSync,realpathSync,linkSync,readdirSync,rmdirSync } from 'node:fs';
 import { join,dirname,basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { normalizeEffects,normalizeEffectRef,animationPreviewHTML } from './canvas-effects.mjs';
 import { BASE,HOME,loadIdentity,readCanvas,previewCanvas,paintCanvas,canvasBatch,safeDisplay } from './client.mjs';
 
 const MAX_PLAN=16*1024*1024,MAX_JOURNAL=32*1024*1024,MAX_RUNS=262144,MAX_PIXELS=2048*2048;
@@ -92,58 +93,62 @@ function lock(path) {
     return publishLock(path);
   }finally{try{releaseReaper?.();}finally{releaseClaim();}}
 }
-function validatePlan(plan) {
-  if(!fields(plan,['version','runs'])||plan.version!==1||!Array.isArray(plan.runs)||!plan.runs.length||plan.runs.length>MAX_RUNS)throw new Error('Invalid drawing plan: use version 1 and 1–262144 runs only.');
+export function validatePlan(plan) {
+  if(!fields(plan,['version','runs','effects'])||![1,2].includes(plan.version)||!Array.isArray(plan.runs)||!plan.runs.length||plan.runs.length>MAX_RUNS||plan.version===1&&'effects' in plan||plan.version===2&&!('effects' in plan))throw new Error('Invalid drawing plan: use version 1 static or version 2 effects and 1–262144 runs only.');
+  const effects=plan.version===2?normalizeEffects(plan.effects):undefined,used=new Set();
   const runs=plan.runs.map(r=>{
-    if(!Array.isArray(r)||r.length!==4||!integer(r[0],0,2047)||!integer(r[1],0,2047)||!integer(r[2],1,2048-r[0])||typeof r[3]!=='string'||!/^#[0-9a-f]{6}$/.test(r[3]))throw new Error('Invalid drawing plan run.');return [...r];
+    if(!Array.isArray(r)||!(r.length===4||r.length===5&&effects)||!integer(r[0],0,2047)||!integer(r[1],0,2047)||!integer(r[2],1,2048-r[0])||typeof r[3]!=='string'||!/^#[0-9a-f]{6}$/.test(r[3]))throw new Error('Invalid drawing plan run.');
+    const result=r.slice(0,4);if(r.length===5){const ref=normalizeEffectRef(r[4],effects);used.add(ref.effect);result.push(ref);}return result;
   }).sort((a,b)=>a[1]-b[1]||a[0]-b[0]);
   for(let i=1;i<runs.length;i++)if(runs[i][1]===runs[i-1][1]&&runs[i][0]<runs[i-1][0]+runs[i-1][2])throw new Error('Drawing plan runs overlap.');
-  return {version:1,runs};
+  if(effects&&Object.keys(effects).some(name=>!used.has(name)))throw new Error('Unused drawing effect definition.');
+  return {version:plan.version,runs,...(effects?{effects}:{})};
 }
-function chunkPlan(plan,state) {
+export function chunkPlan(plan,state) {
   const {policy,limits}=state;
   if(!policy||!limits||!integer(policy.max_batch_pixels,1,65536)||!integer(limits.runs,1,512)||!integer(policy.width,1,2048)||!integer(policy.height,1,2048))throw new Error('Invalid server canvas limits.');
+  // Reserve 4 KiB for the bounded ticket, signatures, guard and request envelope.
+  const bodyLimit=integer(limits.requestBytes,8192,1048576)?Math.min(limits.requestBytes,65536):65536;
   const chunks=[];let runs=[],pixels=0;
-  const flush=()=>{if(runs.length)chunks.push({runs,attempts:[]});runs=[];pixels=0;};
-  for(const [start,y,length,color] of plan.runs){
+  const definitions=rows=>Object.fromEntries([...new Set(rows.filter(r=>r[4]).map(r=>r[4].effect))].sort().map(name=>[name,plan.effects[name]]));
+  const data=rows=>{const effects=definitions(rows);return {runs:rows,...(Object.keys(effects).length?{effects}:{})};};
+  const flush=()=>{if(runs.length)chunks.push({...data(runs),attempts:[]});runs=[];pixels=0;};
+  for(const [start,y,length,color,ref] of plan.runs){
     if(start+length>policy.width||y>=policy.height)throw new Error('Drawing plan exceeds the canvas bounds.');
     for(let x=start,left=length;left;){
       if(pixels===policy.max_batch_pixels||runs.length===limits.runs)flush();
-      const count=Math.min(left,policy.max_batch_pixels-pixels);runs.push([x,y,count,color]);pixels+=count;x+=count;left-=count;
+      const count=Math.min(left,policy.max_batch_pixels-pixels),run=[x,y,count,color,...(ref?[{...ref,phase:(ref.phase+(x-start)*ref.step)%256}]:[])];
+      if(Buffer.byteLength(JSON.stringify(data([...runs,run])))>bodyLimit-4096){if(!runs.length)throw new Error('Effect batch exceeds signed request body limit.');flush();continue;}
+      runs.push(run);pixels+=count;x+=count;left-=count;
     }
   }
   flush();return chunks;
 }
-const payload=(j,i,guard)=>({batch_id:`build-${j.id}-${i}`,runs:j.chunks[i].runs,guard});
+const payload=(j,i,guard)=>({batch_id:`build-${j.id}-${i}`,runs:j.chunks[i].runs,...(j.chunks[i].effects?{effects:j.chunks[i].effects}:{}),guard});
 const done=c=>Boolean(c.receipt||c.skipped);
 const spent=j=>j.chunks.reduce((n,c)=>n+(c.receipt?.pixels??0),0);
 function summary(j) {
   const completed=j.chunks.filter(done).length,last=j.chunks.filter(c=>c.receipt).at(-1)?.receipt;
   return {build_id:j.id,status:completed===j.chunks.length?'complete':j.status,max_pixels:j.max_pixels,spent_pixels:spent(j),
     total_batches:j.chunks.length,completed_batches:completed,remaining_batches:j.chunks.length-completed,
-    ...(j.quote?{quote_id:j.quote.id,cost_pixels:j.quote.cost,expires_ms:j.quote.expires_ms,...(j.quote.rewards?{reward_preview:j.quote.rewards}:{})}:{}),
-    ...(last?{balance_after:last.balance_after,xp_awarded:j.chunks.reduce((n,c)=>n+(c.receipt?.xp_awarded??0),0)}:{}),
-    ...(last&&j.chunks.filter(c=>c.receipt).every(c=>c.receipt.rewards?.enabled)?{eligible_pixels:j.chunks.reduce((n,c)=>n+(c.receipt?.rewards?.eligible_pixels??0),0)}:{}),
-    ...(j.conflict_count?{conflict_count:j.conflict_count,conflicts:j.conflicts}:{}),
+    ...(j.quote?{quote_id:j.quote.id,cost_pixels:j.quote.cost,expires_ms:j.quote.expires_ms}:{}),
+    ...(last?{remaining_after:last.remaining_after}:{}),
+    ...(j.preview_file?{preview_file:j.preview_file}:{}),
     ...(j.error_code?{error_code:j.error_code}:{}),...(j.retry_after?{retry_after:j.retry_after}:{}),
     ...(j.chunks.some(c=>c.pending)?{unresolved_batches:j.chunks.filter(c=>c.pending).length}:{})};
 }
-function cleanRewards(r,changed) {
-  if(r===undefined)return undefined; // Older servers and journals remain usable.
-  if(!r||typeof r.enabled!=='boolean'||!integer(r.policy_version)||r.repeat_window_hours!==24
-    ||!Number.isFinite(r.base_xp_per_pixel)||r.base_xp_per_pixel<0||r.base_xp_per_pixel>1000000
-    ||!integer(r.eligible_pixels,0,changed)||!integer(r.repeat_pixels,0,changed)
-    ||r.eligible_pixels+r.repeat_pixels!==(r.enabled?changed:0)
-    ||!Number.isFinite(r.base_xp)||r.base_xp!==r.eligible_pixels*r.base_xp_per_pixel)throw new Error('Invalid server canvas rewards.');
-  const {enabled,policy_version,repeat_window_hours,base_xp_per_pixel,eligible_pixels,repeat_pixels,base_xp}=r;
-  return {enabled,policy_version,repeat_window_hours,base_xp_per_pixel,eligible_pixels,repeat_pixels,base_xp};
+// Previous owners and the pixels taken from each; the painter is never listed.
+function validOverpainted(o,painter,max) {
+  if(!o||typeof o!=='object'||Array.isArray(o))return false;
+  let total=0;
+  for(const [owner,n] of Object.entries(o)){if(!/^[a-z][a-z0-9_]{2,31}$/.test(owner)||owner===painter||!integer(n,1,max))return false;total+=n;}
+  return total<=max;
 }
 function acceptReceipt(j,i,r) {
   const c=j.chunks[i],b=r?.batch,guard=c.attempts.find(g=>hash(payload(j,i,g))===b?.payload_hash);
   if(r?.type!=='canvas_painted'||!guard||b.handle!==j.handle||b.batch_id!==`build-${j.id}-${i}`||!integer(b.pixels,1,guard.max_pixels)||b.revision!==guard.revision+1
-    ||!integer(r.balance_after)||!Number.isFinite(r.progress?.xp_awarded)||r.progress.xp_awarded<0)throw new Error('Unverified canvas receipt; keep the journal and inspect the batch.');
-  const rewards=cleanRewards(r.rewards,b.pixels);
-  c.receipt={batch_id:b.batch_id,payload_hash:b.payload_hash,pixels:b.pixels,revision:b.revision,balance_after:r.balance_after,xp_awarded:r.progress.xp_awarded,...(rewards?{rewards}:{})};c.pending=false;
+    ||!validOverpainted(b.overpainted,j.handle,b.pixels)||!integer(r.remaining_after))throw new Error('Unverified canvas receipt; keep the journal and inspect the batch.');
+  c.receipt={batch_id:b.batch_id,payload_hash:b.payload_hash,pixels:b.pixels,revision:b.revision,remaining_after:r.remaining_after};c.pending=false;
 }
 async function reconcile(j,write) {
   for(let i=0;i<j.chunks.length;i++){
@@ -153,42 +158,37 @@ async function reconcile(j,write) {
   if(j.status==='unknown'&&!j.chunks.some(c=>c.pending)){j.status='ready';delete j.error_code;delete j.retry_after;write();}
   if(j.chunks.every(done)){j.status='complete';delete j.error_code;delete j.retry_after;write();}
 }
-function checkPreview(q,requested) {
+function checkPreview(q,requested,painter) {
   if(!q||!integer(q.revision)||!integer(q.expires_ms)||!integer(q.changed_pixels,0,requested)||q.no_op_pixels!==requested-q.changed_pixels||q.requested_pixels!==requested
-    ||!integer(q.conflict_count,0,q.changed_pixels)||!Array.isArray(q.conflicts)||q.conflicts.length>Math.min(8,q.conflict_count)||!integer(q.allowance?.remaining)
-    ||q.conflicts.some(c=>!c||!integer(c.x,0,2047)||!integer(c.y,0,2047)||!integer(c.rank)||typeof c.handle!=='string'||!/^[a-z][a-z0-9_]{2,31}$/.test(c.handle))
+    ||!validOverpainted(q.overpainted,painter,q.changed_pixels)||!integer(q.allowance?.remaining)
     ||typeof q.can_paint!=='boolean'||typeof q.enabled!=='boolean'||typeof q.paused!=='boolean')throw new Error('Invalid server canvas preview.');
-  cleanRewards(q.rewards,q.changed_pixels);
 }
 async function quote(j,write) {
   let state;try{state=await readCanvas();}catch(e){return stop(j,write,'preview_incomplete',typeof e.code==='string'?e.code.slice(0,80):'canvas_preview_unavailable',e.retryAfter);}
   if(!integer(state.revision))throw new Error('Invalid server canvas revision.');
   // Cache partial quote reads so large/complex plans can continue after a read throttle.
-  if(state.rewards!==undefined&&!integer(state.rewards?.policy_version))throw new Error('Invalid server canvas rewards.');
-  const stateHash=hash({revision:state.revision,policy:state.policy_version,reward_policy:state.rewards?.policy_version,rank:state.allowance?.rank,balance:state.allowance?.remaining,paused:state.paused});
+  const stateHash=hash({revision:state.revision,policy:state.policy_version,remaining:state.allowance?.remaining,paused:state.paused});
   if(!j.preview||j.preview.state_hash!==stateHash||j.preview.expires_ms<=Date.now())j.preview={revision:state.revision,state_hash:stateHash,expires_ms:Date.now()+300000,parts:{}};
-  let revision=null,expiry=Infinity,cost=0,balance=Infinity,blocked=false,hasRewards=true;const costs=[],rewards={eligible_pixels:0,repeat_pixels:0,base_xp:0};
-  j.conflict_count=0;j.conflicts=[];delete j.error_code;delete j.retry_after;
+  let revision=null,expiry=Infinity,cost=0,remaining=Infinity,blocked=false;const costs=[];
+  delete j.error_code;delete j.retry_after;
   for(let i=0;i<j.chunks.length;i++){
     const c=j.chunks[i];if(done(c)){costs.push(null);continue;}
     let q=j.preview.parts[i];
     if(!q){
-      try{q=await previewCanvas(c.runs);}catch(e){delete j.quote;return stop(j,write,'preview_incomplete',typeof e.code==='string'?e.code.slice(0,80):'canvas_preview_unavailable',e.retryAfter);}
-      checkPreview(q,c.runs.reduce((n,r)=>n+r[2],0));
-      if(q.revision!==j.preview.revision||q.rewards?.policy_version!==state.rewards?.policy_version){j.status='needs_preview';j.error_code='canvas_quote_stale';delete j.quote;delete j.preview;write();return summary(j);}
+      try{q=await previewCanvas(c.runs,{effects:c.effects});}catch(e){delete j.quote;return stop(j,write,'preview_incomplete',typeof e.code==='string'?e.code.slice(0,80):'canvas_preview_unavailable',e.retryAfter);}
+      checkPreview(q,c.runs.reduce((n,r)=>n+r[2],0),j.handle);
+      if(q.revision!==j.preview.revision){j.status='needs_preview';j.error_code='canvas_quote_stale';delete j.quote;delete j.preview;write();return summary(j);}
       q={revision:q.revision,expires_ms:q.expires_ms,changed_pixels:q.changed_pixels,no_op_pixels:q.no_op_pixels,requested_pixels:q.requested_pixels,
-        conflict_count:q.conflict_count,conflicts:q.conflicts.map(({x,y,handle,rank})=>({x,y,handle,rank})),allowance:{remaining:q.allowance.remaining},can_paint:q.can_paint,enabled:q.enabled,paused:q.paused,...(q.rewards?{rewards:cleanRewards(q.rewards,q.changed_pixels)}:{})};
+        allowance:{remaining:q.allowance.remaining},can_paint:q.can_paint,enabled:q.enabled,paused:q.paused};
       j.preview.parts[i]=q;j.preview.expires_ms=Math.min(j.preview.expires_ms,q.expires_ms);write();
     }
-    revision=q.revision;expiry=Math.min(expiry,q.expires_ms);cost+=q.changed_pixels;costs.push(q.changed_pixels);balance=Math.min(balance,q.allowance.remaining);
-    if(q.rewards?.enabled)for(const key of Object.keys(rewards))rewards[key]+=q.rewards[key];else hasRewards=false;
-    blocked||=q.changed_pixels>0&&!q.can_paint;j.conflict_count+=q.conflict_count;
-    for(const c of q.conflicts.slice(0,8-j.conflicts.length))j.conflicts.push({x:c.x,y:c.y,handle:String(c.handle).slice(0,32),rank:c.rank});
+    revision=q.revision;expiry=Math.min(expiry,q.expires_ms);cost+=q.changed_pixels;costs.push(q.changed_pixels);remaining=Math.min(remaining,q.allowance.remaining);
+    blocked||=q.changed_pixels>0&&!q.can_paint;
   }
   if(cost+spent(j)>j.max_pixels){blocked=true;j.error_code='canvas_spend_limit';}
-  else if(cost>balance){blocked=true;j.error_code='canvas_allowance_exceeded';}
-  else if(blocked)j.error_code=j.conflict_count?'canvas_pixel_protected':'canvas_not_ready';
-  j.quote={revision,expires_ms:expiry,cost,costs,...(hasRewards?{rewards}:{})};j.quote.id=hash({plan:j.plan_hash,build:j.id,...j.quote});delete j.preview;j.status=blocked?'blocked':'ready';write();return summary(j);
+  else if(cost>remaining){blocked=true;j.error_code='canvas_allowance_exceeded';}
+  else if(blocked)j.error_code='canvas_not_ready';
+  j.quote={revision,expires_ms:expiry,cost,costs};j.quote.id=hash({plan:j.plan_hash,build:j.id,...j.quote});delete j.preview;j.status=blocked?'blocked':'ready';write();return summary(j);
 }
 function stop(j,write,status,code,retry) {j.status=status;j.error_code=code;if(retry)j.retry_after=retry;else delete j.retry_after;write();return summary(j);}
 async function commitBuild(j,write) {
@@ -207,7 +207,7 @@ async function commitBuild(j,write) {
     if(!c.attempts.some(g=>hash(g)===hash(guard)))c.attempts.push(guard);
     c.pending=true;write();
     try {
-      acceptReceipt(j,i,await paintCanvas(`build-${j.id}-${i}`,c.runs,{guard,attempts:1}));revision=c.receipt.revision;write();
+      acceptReceipt(j,i,await paintCanvas(`build-${j.id}-${i}`,c.runs,{guard,effects:c.effects,attempts:1}));revision=c.receipt.revision;write();
     }catch(e){
       // A lost response or malformed receipt may follow a committed write. Preserve the attempt.
       if(!e.status||e.status>=500)return stop(j,write,'unknown',typeof e.code==='string'?e.code.slice(0,80):'canvas_outcome_unknown',e.retryAfter);
@@ -239,15 +239,18 @@ export async function canvasBuild(options) {
       if(plan_file!==undefined&&hash(validatePlan(readJSON(plan_file,MAX_PLAN)))!==j.plan_hash)throw new Error('Build ID already belongs to a different plan.');
       const stored=readJSON(planPath,MAX_JOURNAL);
       if(!Array.isArray(stored)||stored.length!==j.chunks.length||hash(stored)!==j.chunks_hash)throw new Error('Build plan changed; keep the original plan.');
-      j.chunks.forEach((c,i)=>c.runs=stored[i]);
+      j.chunks.forEach((c,i)=>{if(Array.isArray(stored[i]))c.runs=stored[i];else {c.runs=stored[i].runs;c.effects=stored[i].effects;}});
     }else{
       if(mode!=='preview'||typeof plan_file!=='string'||!integer(max_pixels,0,MAX_PIXELS))throw new Error('Start with preview, plan_file and max_pixels (0–4194304).');
       const plan=validatePlan(readJSON(plan_file,MAX_PLAN)),state=await readCanvas();
-      const chunks=chunkPlan(plan,state),stored=chunks.map(c=>c.runs);
+      const chunks=chunkPlan(plan,state),stored=chunks.map(c=>c.effects?{runs:c.runs,effects:c.effects}:c.runs);
       j={version:1,id,server:BASE,handle:identity.handle,plan_hash:hash(plan),max_pixels,chunks,chunks_hash:hash(stored),status:'new'};
       if(exists(planPath))throw new Error('An incomplete build already owns this ID; inspect it locally or choose another ID.');save(planPath,stored);
+      const html=animationPreviewHTML(plan,{title:'Canvas build '+id});
+      j.preview_file=join(directory,id+'.preview.html');
+      try{writeFileSync(j.preview_file,html,{flag:'wx',mode:0o600});}catch(e){unlinkSync(planPath);throw e;}
     }
-    const write=()=>save(path,{...j,chunks:j.chunks.map(({runs,...c})=>c)});write();
+    const write=()=>save(path,{...j,chunks:j.chunks.map(({runs,effects,...c})=>c)});write();
     if(mode==='commit'&&(!j.quote||typeof quote_id!=='string'||j.quote.id!==quote_id))throw new Error('Use the exact quote_id from this build preview.');
     await reconcile(j,write);
     if(j.chunks.every(done))return summary(j);
