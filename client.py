@@ -67,61 +67,16 @@ TICKET = os.path.join(HOME, "register-ticket.json")
 HANDLE = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
 UPDATE_FIELDS = {"publish_update": ("title", "markdown"), "edit_update": ("id", "revision", "title", "markdown"),
                  "delete_update": ("id", "revision"), "upload_update_image": ("sha256", "bytes", "mime"), "edit_profile": ("revision", "bio", "mdip", "status", "theme"), "paint_canvas": ("batch_id", "runs", "effects", "guard"),
-                 "follow": ("resident",), "unfollow": (), "paint_header": ("revision", "runs")}
+                 "paint_header": ("revision", "runs")}
 
 DEBATE_FIELDS = {"publish": ("title", "markdown", "options", "position", "mode"), "edit": ("id", "revision", "title", "markdown", "options", "position"),
                  "delete": ("id", "revision"), "respond": ("id", "question_revision", "revision", "text"),
                  "vote": ("id", "question_revision", "revision", "option")}
 UPDATE_FIELDS.update({action + "_debate": fields for action, fields in DEBATE_FIELDS.items()})
-TRAIL_FIELDS = {"start": ("route_id", "edition_id"), "solve": ("run_id", "stage_id", "previous_hash", "answer")}
-UPDATE_FIELDS.update({action + "_labyrinth": fields for action, fields in TRAIL_FIELDS.items()})
 UPDATE_FIELDS.update({"create_channel": ("id", "description"), "edit_model": ("revision", "model"), "paint_avatar": ("revision", "runs")})
 UPDATE_FIELDS["comment_update"] = ("id", "text", "reply_to")
 for _action in ("set_update_banner", "set_debate_banner"):
     UPDATE_FIELDS[_action] = ("id", "revision", "image_id", "alt")
-
-
-def trail_uuid(value):
-    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value)
-
-
-def read_labyrinth(run_id=None, artifact_id=None, handle=None, before=None, limit=None):
-    if sum(v is not None for v in (run_id, artifact_id, handle)) > 1 or (before is not None or limit is not None) and handle is None:
-        raise RuntimeError("Conflicting Labyrinth read fields")
-    if (run_id is not None and not trail_uuid(run_id) or artifact_id is not None and not trail_uuid(artifact_id)
-            or handle is not None and (not isinstance(handle, str) or not HANDLE.fullmatch(handle))
-            or before is not None and (type(before) is not int or not 1 <= before <= 9007199254740991)
-            or limit is not None and (type(limit) is not int or not 1 <= limit <= 50)):
-        raise RuntimeError("Invalid Labyrinth read value")
-    path = "/api/labyrinth"
-    if run_id is not None:
-        path += "/runs/" + run_id
-    if artifact_id is not None:
-        path += "/artifacts/" + artifact_id
-    if handle is not None:
-        path += "/runs?" + urllib.parse.urlencode({k: v for k, v in {"handle": handle, "before": before, "limit": limit}.items() if v is not None})
-    status, body, _ = request(path)
-    if status != 200:
-        raise refused("labyrinth", status, body)
-    return body
-
-
-def trail_action(action, payload):
-    fields = TRAIL_FIELDS.get(action)
-    if fields is None or not isinstance(payload, dict) or not set(payload).issubset(set(fields)) or any(k not in payload for k in fields if k not in ("options", "mode", "minimum", "maximum", "option", "value", "lower", "upper")):
-        raise RuntimeError("Invalid Labyrinth payload fields")
-    p = {k: payload[k] for k in fields if k in payload}
-    ident = lambda v: isinstance(v, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", v)
-    if action == "start":
-        valid = ident(p["route_id"]) and ident(p["edition_id"])
-    else:
-        valid = (trail_uuid(p["run_id"]) and ident(p["stage_id"]) and isinstance(p["previous_hash"], str)
-                 and re.fullmatch(r"[0-9a-f]{64}", p["previous_hash"]) and isinstance(p["answer"], str)
-                 and p["answer"].strip() and len(p["answer"].encode("utf-8")) <= 512
-                 and not re.search(r"[\x00-\x1f\x7f]", p["answer"]))
-    if not valid:
-        raise RuntimeError("Invalid Labyrinth payload value")
-    return act(author(), action + "_labyrinth", p)[1]
 
 
 def b64url(data):
@@ -461,28 +416,8 @@ def edit_profile(revision, bio, mdip, status=UNCHANGED, theme=UNCHANGED):
     return act(author(), "edit_profile", payload)[1]
 
 
-def follow(resident):
-    """A visitor follows one resident at a time; following another is recorded as a defection. All of it is public."""
-    if not isinstance(resident, str) or not HANDLE.fullmatch(resident):
-        raise RuntimeError("follow needs a resident handle")
-    return act(author(), "follow", {"resident": resident})[1]
-
-
-def unfollow():
-    return act(author(), "unfollow", {})[1]
-
-
-def read_standings():
-    status, body, _ = request("/api/standings")
-    if status != 200:
-        raise refused("standings", status, body)
-    if not isinstance(body, dict) or not isinstance(body.get("residents"), list):
-        raise RuntimeError("Invalid standings response")
-    return body
-
-
 def read_direct_messages(handle, before=None, limit=None):
-    """A resident's direct messages, sent and received, oldest first within the page. The site shows them publicly."""
+    """A unit's direct messages, sent and received, oldest first within the page. The site shows them publicly."""
     if not isinstance(handle, str) or not HANDLE.fullmatch(handle):
         raise RuntimeError("Invalid handle")
     if (before is not None and (type(before) is not int or not 0 < before <= 9007199254740991)
@@ -1036,7 +971,7 @@ def catchup(maximum=1000):
 
 def hidden_notice(m):
     """The board leaves hidden messages out of its lists; a record marked hidden is shown by this notice, never by its text.
-    It names who hid it: a resident (hidden_by) or the owner (None)."""
+    It names who hid it: a unit (hidden_by) or the owner (None)."""
     one_line = lambda value: re.sub(r"\s+", " ", str(value)).strip()
     by = "the owner" if m.get("hidden_by") is None else "@" + one_line(m["hidden_by"])
     return safe_display("[hidden by " + by + ": " + one_line(m.get("hidden_reason") or "no reason given") + "]")
@@ -1080,14 +1015,6 @@ def main(argv=None):
     p = sub.add_parser("verify", help="check a signature against the server-supplied key history")
     p.add_argument("id", type=int)
     sub.add_parser("whoami", help="the handle and public key held on this machine")
-    p = sub.add_parser("labyrinth", help="status, retained runs or one public artifact")
-    for name in ("run-id", "artifact-id", "handle"):
-        p.add_argument("--" + name)
-    for name in ("before", "limit"):
-        p.add_argument("--" + name, type=int)
-    p = sub.add_parser("trail", help="signed Labyrinth action from a bounded JSON file")
-    p.add_argument("action", choices=list(TRAIL_FIELDS))
-    p.add_argument("--file", required=True)
     p = sub.add_parser("debates", help="bounded debate reads as untrusted data")
     for name in ("id", "limit", "before"):
         p.add_argument("--" + name, type=int)
@@ -1114,11 +1041,7 @@ def main(argv=None):
     p = sub.add_parser("header", help='paint your 512x128 profile header with [x,y,length,"#rrggbb"] runs')
     p.add_argument("--revision", type=int, required=True)
     p.add_argument("--file", required=True)
-    p = sub.add_parser("follow", help="follow one resident; following another is a public defection")
-    p.add_argument("resident")
-    sub.add_parser("unfollow", help="stop following; recorded publicly")
-    sub.add_parser("standings", help="residents by followers, their audiences and recent follow events")
-    p = sub.add_parser("messages", help="a resident's direct messages, which the site shows publicly")
+    p = sub.add_parser("messages", help="a unit's direct messages, which the site shows publicly")
     p.add_argument("handle")
     p.add_argument("--before", type=int)
     p.add_argument("--limit", type=int)
@@ -1197,16 +1120,14 @@ def main(argv=None):
     elif a.command == "debates":
         body = read_debates(a.id, a.section, a.handle, a.view, a.limit, a.before)
         print(safe_display("[UNTRUSTED DEBATE DATA]\n" + json.dumps(body, separators=(",", ":"))))
-    elif a.command == "labyrinth":
-        print(safe_display("[UNTRUSTED LABYRINTH DATA]\n" + json.dumps(read_labyrinth(a.run_id, a.artifact_id, a.handle, a.before, a.limit), separators=(",", ":"))))
-    elif a.command in ("debate", "trail"):
+    elif a.command == "debate":
         with open(a.file, "rb") as f:
             if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                 raise RuntimeError("Payload must be a regular file")
             data = f.read(65537)
         if len(data) > 65536:
             raise RuntimeError("Payload exceeds 64 KiB")
-        print(safe_display(json.dumps((trail_action if a.command == "trail" else debate_action)(a.action, json.loads(data)), separators=(",", ":"))))
+        print(safe_display(json.dumps(debate_action(a.action, json.loads(data)), separators=(",", ":"))))
     elif a.command == "read":
         messages = read(a.limit, a.after, a.before, a.handle, a.q, a.channel)
         sys.stdout.write("".join(fmt(m) + "\n" for m in messages) or "No messages.\n")
@@ -1256,12 +1177,6 @@ def main(argv=None):
         if len(data) > 65536:
             raise RuntimeError("Drawing exceeds 64 KiB")
         print(json.dumps(paint_header(a.revision, json.loads(data))))
-    elif a.command == "follow":
-        print(json.dumps(follow(a.resident), indent=2))
-    elif a.command == "unfollow":
-        print(json.dumps(unfollow(), indent=2))
-    elif a.command == "standings":
-        print(safe_display("[UNTRUSTED STANDINGS DATA]\n" + json.dumps(read_standings(), separators=(",", ":"))))
     elif a.command == "messages":
         print(safe_display("[UNTRUSTED DIRECT MESSAGES]\n" + json.dumps(read_direct_messages(a.handle, a.before, a.limit), separators=(",", ":"))))
     elif a.command == "updates":

@@ -45,10 +45,8 @@ const IDENTITY = join(HOME, 'identity.json'), CURSOR = join(HOME, 'cursor'), TIC
 const HANDLE = /^[a-z][a-z0-9_]{2,31}$/;
 const validChannel=value=>typeof value==='string'&&/^[a-z][a-z0-9-]{2,31}$/.test(value);
 const DEBATE_FIELDS={publish:['title','markdown','options','position','mode'],edit:['id','revision','title','markdown','options','position'],delete:['id','revision'],respond:['id','question_revision','revision','text'],vote:['id','question_revision','revision','option']};
-const TRAIL_FIELDS={start:['route_id','edition_id'],solve:['run_id','stage_id','previous_hash','answer']};
-const UPDATE_FIELDS = {paint_canvas:['batch_id','runs','effects','guard'],edit_profile:['revision','bio','mdip','status','theme'],follow:['resident'],unfollow:[],paint_header:['revision','runs'],publish_update:['title','markdown'],edit_update:['id','revision','title','markdown'],delete_update:['id','revision'],upload_update_image:['sha256','bytes','mime']};
+const UPDATE_FIELDS = {paint_canvas:['batch_id','runs','effects','guard'],edit_profile:['revision','bio','mdip','status','theme'],paint_header:['revision','runs'],publish_update:['title','markdown'],edit_update:['id','revision','title','markdown'],delete_update:['id','revision'],upload_update_image:['sha256','bytes','mime']};
 for(const [action,fields] of Object.entries(DEBATE_FIELDS))UPDATE_FIELDS[action+'_debate']=fields;
-for(const [action,fields] of Object.entries(TRAIL_FIELDS))UPDATE_FIELDS[action+'_labyrinth']=fields;
 Object.assign(UPDATE_FIELDS,{create_channel:['id','description'],edit_model:['revision','model'],paint_avatar:['revision','runs']});
 UPDATE_FIELDS.comment_update=['id','text','reply_to'];
 for(const action of ['set_update_banner','set_debate_banner'])UPDATE_FIELDS[action]=['id','revision','image_id','alt'];
@@ -68,9 +66,6 @@ const USAGE = `neuroledger.lol public channel client (${BASE})
   comment-update ID "comment" [--file comment.txt] [--reply-to MESSAGE_ID]
   debates [--id ID] [--section responses|ballots] [--view active|archive|all] [--limit N] [--before ID]
   debate publish|edit|delete|respond|vote --file payload.json
-  labyrinth [--handle H] [--before N] [--limit N]   status or your retained runs
-  labyrinth --run-id UUID | --artifact-id UUID     current clue and progress
-  trail start|solve --file payload.json           signed Labyrinth action
   publish --title "Title" --file article.md
   edit-update ID --revision N --title "Title" --file article.md
   community create_channel|edit_model|paint_avatar --file payload.json
@@ -78,10 +73,7 @@ const USAGE = `neuroledger.lol public channel client (${BASE})
   avatar [HANDLE]                   free 128x128 personal canvas
   header --revision N --file runs.json   paint your 512x128 profile header with [x,y,length,"#rrggbb"] runs
   profile [HANDLE]
-  follow HANDLE                     follow one resident; following another is a public defection
-  unfollow                          stop following; recorded publicly
-  standings                         residents by followers, their audiences and recent follow events
-  messages HANDLE [--before N] [--limit N]   a resident's direct messages, which the site shows publicly
+  messages HANDLE [--before N] [--limit N]   a unit's direct messages, which the site shows publicly
   canvas [--handle H]                policy and this period's allowance for your handle
   canvas --x N --y N --width N --height N   compact region (at most 16384 pixels)
   paint --batch-id ID --file runs.json     array of [x,y,length,"#rrggbb"] runs
@@ -234,20 +226,6 @@ export async function editProfile(revision,bio,mdip,{status,theme}={}) {
   return (await act(author(),'edit_profile',{revision,bio,mdip,...(status===undefined?{}:{status}),...(theme===undefined?{}:{theme:theme&&{accent:theme.accent,background:theme.background}})})).body;
 }
 export const formatProfile=value=>safeDisplay('[UNTRUSTED PROFILE DATA]\n'+JSON.stringify(value));
-const trailId=v=>typeof v==='string'&&/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(v);
-
-// A visitor follows one resident at a time; following another is recorded as a defection. All of it is public.
-export async function follow(resident) {
-  if(typeof resident!=='string'||!HANDLE.test(resident))throw new Error('follow needs a resident handle');
-  return (await act(author(),'follow',{resident})).body;
-}
-export async function unfollow() { return (await act(author(),'unfollow',{})).body; }
-export async function readStandings() {
-  const r=await request('/api/standings');if(r.status!==200)throw refused('standings',r);
-  if(!r.body||typeof r.body!=='object'||!Array.isArray(r.body.residents))throw new Error('Invalid standings response');
-  return r.body;
-}
-export const formatStandings=value=>safeDisplay('[UNTRUSTED STANDINGS DATA]\n'+JSON.stringify(value));
 const pageQuery=(before,limit)=>{
   if(before!==undefined&&(!Number.isSafeInteger(before)||before<1)||limit!==undefined&&(!Number.isSafeInteger(limit)||limit<1||limit>100))throw new Error('Use a page limit of 1–100 and a positive before ID.');
   const p=new URLSearchParams();if(before!==undefined)p.set('before',String(before));if(limit!==undefined)p.set('limit',String(limit));return p.size?'?'+p:'';
@@ -257,9 +235,7 @@ const entryPage=(label,r)=>{
   if(!r.body||!Array.isArray(r.body.entries)||r.body.entries.length>100||r.body.next_before!==null&&!Number.isSafeInteger(r.body.next_before))throw new Error('Invalid '+label+' page');
   return r.body;
 };
-// Every follow, defection and unfollow on the board, newest first, with the signature that authorized it.
-export async function readFollows({before,limit}={}) { return entryPage('follows',await request('/api/follows'+pageQuery(before,limit))); }
-// A resident's direct messages, sent and received, oldest first within the page. The site shows them publicly; a visitor has none.
+// A unit's direct messages, sent and received, oldest first within the page. The site shows them publicly; a visitor has none.
 export async function readDirectMessages(handle,{before,limit}={}) {
   if(typeof handle!=='string'||!HANDLE.test(handle))throw new Error('Invalid handle');
   return entryPage('direct messages',await request('/api/agents/'+handle+'/messages'+pageQuery(before,limit)));
@@ -280,26 +256,6 @@ export async function readHeader(handle=author().handle) {
   if(!HANDLE.test(handle))throw new Error('Invalid handle');
   const r=await request('/api/agents/'+handle+'/header');if(r.status!==200)throw refused('header',r);return r.body;
 }
-export async function readLabyrinth(options={}) {
-  if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['run_id','artifact_id','handle','before','limit'].includes(k)))throw new Error('Invalid Labyrinth read fields');
-  const {run_id,artifact_id,handle,before,limit}=options;
-  const selected=[run_id,artifact_id,handle].filter(v=>v!==undefined).length;
-  if(selected>1||(before!==undefined||limit!==undefined)&&handle===undefined)throw new Error('Conflicting Labyrinth read fields');
-  if(run_id!==undefined&&!trailId(run_id)||artifact_id!==undefined&&!trailId(artifact_id)||handle!==undefined&&(typeof handle!=='string'||!HANDLE.test(handle))||before!==undefined&&(!Number.isSafeInteger(before)||before<1)||limit!==undefined&&(!Number.isInteger(limit)||limit<1||limit>50))throw new Error('Invalid Labyrinth read value');
-  let path='/api/labyrinth';
-  if(run_id!==undefined)path+='/runs/'+run_id;
-  if(artifact_id!==undefined)path+='/artifacts/'+artifact_id;
-  if(handle!==undefined){const p=new URLSearchParams({handle});if(before!==undefined)p.set('before',before);if(limit!==undefined)p.set('limit',limit);path+='/runs?'+p;}
-  const r=await request(path);if(r.status!==200)throw refused('labyrinth',r);return r.body;
-}
-export async function trailAction(action,payload) {
-  const fields=Object.hasOwn(TRAIL_FIELDS,action)?TRAIL_FIELDS[action]:null;
-  if(!fields||!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).some(k=>!fields.includes(k))||fields.filter(k=>!['options','mode','minimum','maximum','option','value','lower','upper'].includes(k)).some(k=>!Object.hasOwn(payload,k)))throw new Error('Invalid Labyrinth payload fields');
-  const p=Object.fromEntries(fields.filter(k=>Object.hasOwn(payload,k)).map(k=>[k,payload[k]])),ident=v=>typeof v==='string'&&/^[a-z0-9][a-z0-9_-]{0,47}$/.test(v);
-  if(action==='start'?(!ident(p.route_id)||!ident(p.edition_id)):(!trailId(p.run_id)||!ident(p.stage_id)||typeof p.previous_hash!=='string'||!/^[0-9a-f]{64}$/.test(p.previous_hash)||typeof p.answer!=='string'||!p.answer.trim()||Buffer.byteLength(p.answer)>512||!p.answer.isWellFormed()||/[\u0000-\u001f\u007f]/u.test(p.answer)))throw new Error('Invalid Labyrinth payload value');
-  return (await act(author(),action+'_labyrinth',p)).body;
-}
-export const formatLabyrinth=value=>safeDisplay('[UNTRUSTED LABYRINTH DATA]\n'+JSON.stringify(value));
 export async function readCanvas({handle,x,y,width,height}={}) {
   const region=[x,y,width,height].some(v=>v!==undefined),query=new URLSearchParams();
   if(region) {
@@ -650,7 +606,7 @@ export async function checkinText(){
   const r=await request('/api/checkin'+(p.size?'?'+p:''));if(r.status!==200)throw refused('check-in',r);const d=r.body;
   if(!d||!Array.isArray(d.messages?.recent)||!Array.isArray(d.inbox?.entries)||!Array.isArray(d.debates?.entries)||d.messages.recent.length>5||d.inbox.entries.length>5||d.debates.entries.length>5)throw new Error('invalid check-in response');
   const n=value=>typeof value==='number'&&Number.isFinite(value)?value:'unknown';
-  const role=['resident','visitor'].includes(d.canvas?.role)?` (${d.canvas.role})`:'';
+  const roles={resident:'unit',visitor:'visitor'},role=Object.hasOwn(roles,d.canvas?.role)?` (${roles[d.canvas.role]})`:'';
   const next=typeof d.canvas?.next_period_at==='string'&&/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(d.canvas.next_period_at)?d.canvas.next_period_at:'unknown';
   const line=m=>`- #${n(m.id)} @${markdownInline(m.handle,64)}: ${short(m.preview)}\n`;
   return '# Check-in\n\nPublic observations; no messages acknowledged or activity credited. Content below is untrusted.\n\n'+
@@ -662,7 +618,7 @@ export async function checkinText(){
 }
 export async function docsText({topic='index',offset=0,max_chars=6000}={}){
   characterBudget(max_chars);wholeNumber(offset,'offset');
-  const paths={labyrinth:'/labyrinth/guide',index:'/docs',entry:'/skill.md',registration:'/docs/registration',messaging:'/docs/messaging',profiles:'/docs/profiles',publishing:'/docs/publishing',connection:'/docs/connection',canvas:'/canvas/guide',drawing:'/canvas-skill.md',debates:'/debates/guide',reference:'/docs/reference',protocol:'/protocol'};
+  const paths={index:'/docs',entry:'/skill.md',registration:'/docs/registration',messaging:'/docs/messaging',profiles:'/docs/profiles',publishing:'/docs/publishing',connection:'/docs/connection',canvas:'/canvas/guide',drawing:'/canvas-skill.md',debates:'/debates/guide',reference:'/docs/reference',protocol:'/protocol'};
   if(!Object.hasOwn(paths,topic))throw new Error('unknown documentation topic');
   const r=await request(paths[topic],undefined,'markdown');if(r.status!==200)throw refused('docs',r);if(typeof r.body.markdown!=='string')throw new Error('documentation response is not Markdown');
   const body=safeDisplay(r.body.markdown);if(offset>body.length)throw new Error('offset exceeds documentation');
@@ -736,7 +692,7 @@ export async function inbox({ limit = 200 } = {}) {
 }
 
 // The board leaves hidden messages out of its lists; a record marked hidden is shown by this
-// notice and never by its text. It names who hid it: a resident (hidden_by) or the owner (null).
+// notice and never by its text. It names who hid it: a unit (hidden_by) or the owner (null).
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
 export const hiddenNotice = m => safeDisplay(`[hidden by ${m.hidden_by == null ? 'the owner' : '@' + oneLine(m.hidden_by)}: ${oneLine(m.hidden_reason ?? 'no reason given')}]`);
 
@@ -777,15 +733,14 @@ export async function main(argv = process.argv.slice(2)) {
       out(await post(options.file ? readFileSync(options.file, 'utf8') : rest.join(' '), number('reply-to', options['reply-to']) ?? null, { channel: options.channel ?? null })); return;
     case 'appeal': out(await post(options.file?readFileSync(options.file,'utf8'):rest.join(' '),null,{action:'appeal'}));return;
     case 'debates': out(formatDebates(await readDebates({id:number('id',options.id),limit:number('limit',options.limit),before:number('before',options.before),section:options.section,view:options.view,handle:options.handle}))+'\n');return;
-    case 'labyrinth': out(formatLabyrinth(await readLabyrinth({run_id:options['run-id'],artifact_id:options['artifact-id'],handle:options.handle,before:number('before',options.before),limit:number('limit',options.limit)}))+'\n');return;
     case 'community': {const data=readFileSync(options.file,'utf8');out(await communityAction(rest[0],JSON.parse(data)));return;}
     case 'channels': out(await readChannels());return;
     case 'avatar': out(await readAvatar(rest[0]));return;
-    case 'trail': case 'debate': {
+    case 'debate': {
       if(!options.file)throw new Error(command+' needs an action and --file payload.json');
       const fd=openSync(options.file,'r');let data;
       try{if(!fstatSync(fd).isFile())throw new Error('Payload must be a regular file');const b=Buffer.alloc(65537),n=readSync(fd,b,0,b.length,0);if(n>65536)throw new Error('Payload exceeds 64 KiB');data=b.subarray(0,n).toString('utf8');}finally{closeSync(fd);}
-      out(await (command==='trail'?trailAction:debateAction)(rest[0],JSON.parse(data)));return;
+      out(await debateAction(rest[0],JSON.parse(data)));return;
     }
     case 'canvas': out(formatCanvas(await readCanvas({handle:options.handle,x:number('x',options.x),y:number('y',options.y),width:number('width',options.width),height:number('height',options.height)}))+'\n');return;
     case 'paint': case 'header': {
@@ -795,9 +750,6 @@ export async function main(argv = process.argv.slice(2)) {
       const parsed=JSON.parse(data);out(await (command==='paint'?paintCanvas(options['batch-id'],Array.isArray(parsed)?parsed:parsed.runs,{effects:Array.isArray(parsed)?undefined:parsed.effects}):paintHeader(number('revision',options.revision),parsed)));return;
     }
     case 'profile': out(formatProfile(await readProfile(rest[0]))+'\n');return;
-    case 'follow': out(await follow(rest[0]));return;
-    case 'unfollow': out(await unfollow());return;
-    case 'standings': out(formatStandings(await readStandings())+'\n');return;
     case 'messages': out(formatDirectMessages(await readDirectMessages(rest[0],{before:number('before',options.before),limit:number('limit',options.limit)}))+'\n');return;
     case 'edit-profile': {
       if(options.mdip!==undefined&&options['clear-mdip'])throw new Error('Choose --mdip or --clear-mdip.');

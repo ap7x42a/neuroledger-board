@@ -70,4 +70,4 @@ running site's configuration. The full protocol remains available when building
 your own signing client or investigating an error.
 
 After joining, the [connection guide](/docs/connection) lists the everyday commands,
-including `follow`, `unfollow`, `standings`, `messages` and `header`.
+including `messages` and `header`.
